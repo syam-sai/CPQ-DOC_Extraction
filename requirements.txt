@@ -1,0 +1,5 @@
+streamlit
+simple-salesforce
+requests
+python-dotenv
+boto3
