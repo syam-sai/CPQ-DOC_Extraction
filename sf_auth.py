@@ -17,12 +17,42 @@
 
 import requests
 from simple_salesforce import Salesforce
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+AUTH_TIMEOUT_SECONDS = 30
+
+
+class SalesforceAuthSession(requests.Session):
+    """Use bounded requests and retry transient Salesforce gateway failures."""
+
+    def __init__(self):
+        super().__init__()
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"POST"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.mount("https://", adapter)
+        self.mount("http://", adapter)
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", AUTH_TIMEOUT_SECONDS)
+        return super().request(method, url, **kwargs)
 
 
 def connect_client_credentials(client_id, client_secret, domain="login"):
     """OAuth 2.0 Client Credentials Flow — server-to-server, no user password."""
     url = f"https://{domain}.salesforce.com/services/oauth2/token"
-    response = requests.post(url, data={
+    session = SalesforceAuthSession()
+    response = session.post(url, data={
         "grant_type": "client_credentials",
         "client_id": client_id,
         "client_secret": client_secret,
@@ -39,6 +69,7 @@ def connect_username_password(username, password, security_token="", domain="log
         password=password,
         security_token=security_token,
         domain=domain,
+        session=SalesforceAuthSession(),
     )
 
 

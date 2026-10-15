@@ -3,3 +3,4 @@ simple-salesforce
 requests
 python-dotenv
 boto3
+openpyxl

@@ -14,10 +14,12 @@ import streamlit as st
 import json
 from datetime import datetime, timezone
 
+import io
 import config
 import sf_auth
 import extractor
 import storage
+import xlsx_export
 
 st.set_page_config(page_title="CPQ Config Extractor", layout="wide")
 
@@ -214,10 +216,26 @@ else:
                 st.caption(f"Also saved to `{bundle['s3_path']}`")
 
             st.markdown("### Download")
+
             json_str = json.dumps(data, indent=2)
             st.download_button(
-                label="⬇️ Download full extract as JSON",
+                label="⬇️ Download as JSON",
                 data=json_str,
                 file_name=f"{selected}_cpq_extract.json",
                 mime="application/json",
+                use_container_width=True,
+            )
+
+            # Build the workbook fresh each time — cheap relative to the
+            # Salesforce extraction itself, and avoids caching stale bytes.
+            wb = xlsx_export.build_workbook(data)
+            xlsx_buffer = io.BytesIO()
+            wb.save(xlsx_buffer)
+            xlsx_buffer.seek(0)
+            st.download_button(
+                label="⬇️ Download as Excel (21 tabs)",
+                data=xlsx_buffer,
+                file_name=f"{selected}_cpq_extract.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
             )
