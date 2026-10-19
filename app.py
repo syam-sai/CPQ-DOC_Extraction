@@ -1,41 +1,45 @@
 # app.py
 #
-# Run locally:   streamlit run app.py
-# Run in AWS:    same command, inside the container (see Dockerfile) —
-#                behavior adapts automatically based on config.py's
-#                environment variables (APP_ENV, S3_BUCKET, etc).
+# Streamlit UI for Salesforce CPQ Configuration Extractor & Client Document Generator.
 #
-# Credentials entered manually via the sidebar form live ONLY in this
-# session's memory — nothing is written to disk locally. In AWS mode,
-# credentials can instead be loaded from Secrets Manager and are never
-# typed into the UI at all.
+# Key Features:
+#   - Connects via Client Credentials or Username/Password
+#   - Local-first run folders with streaming outputs (NDJSON, JSON, 21-tab XLSX)
+#   - Client Document Generator (.docx) powered by doc_gen CLI with live status polling
+#   - Memory efficient: saved artifacts are streamed/read from disk; reruns never rebuild data
 
-import streamlit as st
+import os
+import sys
+import time
 import json
+import subprocess
 from datetime import datetime, timezone
 
-import io
+import streamlit as st
 import config
 import sf_auth
 import extractor
+import transformer
 import storage
 import xlsx_export
 
-st.set_page_config(page_title="CPQ Config Extractor", layout="wide")
+st.set_page_config(page_title="CPQ Config Extractor & Document Generator", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 if "instances" not in st.session_state:
-    st.session_state.instances = {}   # name -> instance dict (see sf_auth.connect)
+    st.session_state.instances = {}
 if "selected_instance" not in st.session_state:
     st.session_state.selected_instance = None
-if "extract_results" not in st.session_state:
-    st.session_state.extract_results = {}  # name -> {"data": ..., "counts": ...}
+if "active_run_dir" not in st.session_state:
+    st.session_state.active_run_dir = None
+if "run_metadata" not in st.session_state:
+    st.session_state.run_metadata = {}
 
 
 # ---------------------------------------------------------------------------
-# Relationship diagram (static structure, annotated with live counts)
+# Relationship diagram (annotated with live counts)
 # ---------------------------------------------------------------------------
 def build_relationship_graph(counts):
     return f"""
@@ -62,21 +66,36 @@ def build_relationship_graph(counts):
     """
 
 
+def find_existing_runs():
+    """Finds all existing completed runs in data/runs."""
+    base = os.path.abspath("data/runs")
+    if not os.path.exists(base):
+        return []
+    runs = []
+    for inst in os.listdir(base):
+        inst_dir = os.path.join(base, inst)
+        if os.path.isdir(inst_dir):
+            for r in os.listdir(inst_dir):
+                r_dir = os.path.join(inst_dir, r)
+                status_file = os.path.join(r_dir, "status.json")
+                out_xlsx = os.path.join(r_dir, "output", "cpq_extract.xlsx")
+                if os.path.exists(status_file) or os.path.exists(out_xlsx):
+                    runs.append((f"{inst} / {r}", r_dir))
+    return sorted(runs, reverse=True)
+
+
 # ---------------------------------------------------------------------------
-# Sidebar — instance manager
+# Sidebar — instances & existing runs
 # ---------------------------------------------------------------------------
-st.sidebar.header("Salesforce instances")
+st.sidebar.header("Salesforce Instances")
 st.sidebar.caption(f"Mode: `{config.APP_ENV}`")
 
-# --- Manual add form ---
-st.sidebar.subheader("Add instance manually")
-
+# Manual add form
+st.sidebar.subheader("Add Instance")
 auth_method_label = st.sidebar.radio(
     "Auth method",
     ["Username + password (works now)", "Client credentials (use once available)"],
     key="new_instance_auth_method",
-    help="Salesforce is retiring the username+password flow — switch to "
-         "client credentials as soon as your admin can create the Connected App.",
 )
 
 with st.sidebar.form("add_instance_form", clear_on_submit=True):
@@ -92,7 +111,6 @@ with st.sidebar.form("add_instance_form", clear_on_submit=True):
         client_secret = st.text_input("Consumer secret", type="password")
 
     submitted = st.form_submit_button("Add instance")
-
     if submitted:
         if not name:
             st.sidebar.error("Instance name is required.")
@@ -120,30 +138,25 @@ with st.sidebar.form("add_instance_form", clear_on_submit=True):
                 }
             st.sidebar.success(f"Added '{name}'")
 
-st.sidebar.caption("Manually entered credentials live only in this session's memory.")
-
-# --- AWS Secrets Manager loader (only relevant in aws mode, but shown either
-#     way in case someone wants to test against Secrets Manager locally too) ---
+# AWS Secrets Manager loader
 st.sidebar.divider()
-with st.sidebar.expander("Load instances from AWS Secrets Manager"):
+with st.sidebar.expander("Load from AWS Secrets Manager"):
     st.caption(f"Looks for secrets named '{config.SECRETS_PREFIX}*' in region {config.AWS_REGION}.")
     if st.button("Refresh from Secrets Manager"):
         try:
             secret_names = storage.list_secret_instances(config.SECRETS_PREFIX, config.AWS_REGION)
-            if not secret_names:
-                st.warning("No matching secrets found.")
             for secret_name in secret_names:
                 display_name = secret_name.replace(config.SECRETS_PREFIX, "")
                 instance = storage.get_secret_instance(secret_name, config.AWS_REGION)
                 st.session_state.instances[display_name] = instance
-            st.success(f"Loaded {len(secret_names)} instance(s) from Secrets Manager.")
+            st.success(f"Loaded {len(secret_names)} instance(s).")
         except Exception as e:
-            st.error(f"Could not reach Secrets Manager: {e}")
+            st.error(f"Secrets Manager error: {e}")
 
-# --- Instance list ---
-st.sidebar.divider()
+# Instance List
 if st.session_state.instances:
-    st.sidebar.subheader("Your instances")
+    st.sidebar.divider()
+    st.sidebar.subheader("Configured Instances")
     for inst_name, inst in list(st.session_state.instances.items()):
         col1, col2 = st.sidebar.columns([3, 1])
         badge = "🔑" if inst["auth_method"] == "client_credentials" else "🔓"
@@ -151,91 +164,261 @@ if st.session_state.instances:
             st.session_state.selected_instance = inst_name
         if col2.button("🗑", key=f"delete_{inst_name}"):
             del st.session_state.instances[inst_name]
-            st.session_state.extract_results.pop(inst_name, None)
             if st.session_state.selected_instance == inst_name:
                 st.session_state.selected_instance = None
             st.rerun()
 
+# Existing Runs Browser
+existing_runs = find_existing_runs()
+if existing_runs:
+    st.sidebar.divider()
+    st.sidebar.subheader("Saved Run Folders")
+    selected_run_label = st.sidebar.selectbox(
+        "Browse past runs",
+        ["-- Select an existing run --"] + [label for label, _ in existing_runs],
+        key="selected_existing_run"
+    )
+    if selected_run_label != "-- Select an existing run --":
+        run_path = dict(existing_runs)[selected_run_label]
+        if st.sidebar.button("📂 Load Selected Run", use_container_width=True):
+            st.session_state.active_run_dir = run_path
+            # Load metadata
+            status_file = os.path.join(run_path, "status.json")
+            if os.path.exists(status_file):
+                with open(status_file, "r", encoding="utf-8") as f:
+                    st.session_state.run_metadata = json.load(f)
+            st.rerun()
+
+
 # ---------------------------------------------------------------------------
-# Main area
+# Main Area
 # ---------------------------------------------------------------------------
-st.title("Salesforce CPQ configuration extractor")
+st.title("Salesforce CPQ Extractor & Document Generator")
 
-if not st.session_state.instances:
-    st.info("Add a Salesforce instance from the sidebar to get started.")
-else:
-    selected = st.session_state.selected_instance
-    if not selected:
-        st.info("Select an instance from the sidebar.")
-    else:
-        instance = st.session_state.instances[selected]
-        st.subheader(f"Instance: {selected}")
-        method_display = "Client credentials" if instance["auth_method"] == "client_credentials" else "Username + password"
-        st.caption(f"Auth: `{method_display}` · Domain: `{instance['domain']}`")
+selected = st.session_state.selected_instance
 
-        if st.button("🔌 Connect & extract data", type="primary"):
-            status = st.empty()
-            try:
-                status.info("Connecting to Salesforce...")
-                sf = sf_auth.connect(instance)
+if selected and selected in st.session_state.instances:
+    instance = st.session_state.instances[selected]
+    st.subheader(f"Connected Instance: {selected}")
+    method_display = "Client credentials" if instance["auth_method"] == "client_credentials" else "Username + password"
+    st.caption(f"Auth: `{method_display}` · Domain: `{instance['domain']}`")
 
-                def progress(msg):
-                    status.info(msg)
+    if st.button("🔌 Connect & Extract Data", type="primary"):
+        status_box = st.empty()
+        progress_bar = st.progress(0.0)
 
-                data, counts = extractor.extract_all(sf, progress_callback=progress)
-                st.session_state.extract_results[selected] = {"data": data, "counts": counts}
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.abspath(os.path.join("data", "runs", selected, run_id))
+        os.makedirs(os.path.join(run_dir, "output"), exist_ok=True)
+        os.makedirs(os.path.join(run_dir, "raw"), exist_ok=True)
 
-                # Auto-upload to S3 if configured
-                if config.S3_BUCKET:
-                    status.info("Uploading to S3...")
-                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    key = f"extracts/{selected}/{timestamp}.json"
-                    s3_path = storage.save_to_s3(data, config.S3_BUCKET, key, config.AWS_REGION)
-                    st.session_state.extract_results[selected]["s3_path"] = s3_path
+        try:
+            status_box.info("Connecting to Salesforce...")
+            progress_bar.progress(0.1)
+            sf = sf_auth.connect(instance)
 
-                status.success("Extraction complete.")
-            except Exception as e:
-                status.error(f"Failed: {e}")
+            def progress_cb(msg):
+                status_box.info(msg)
 
-        if selected in st.session_state.extract_results:
-            bundle = st.session_state.extract_results[selected]
-            counts = bundle["counts"]
-            data = bundle["data"]
+            extract_log = {}
+            data, counts = extractor.extract_all(
+                sf,
+                progress_callback=progress_cb,
+                run_dir=run_dir,
+                extract_log=extract_log,
+            )
+            progress_bar.progress(0.6)
 
-            st.markdown("### Object relationship map")
-            st.graphviz_chart(build_relationship_graph(counts), use_container_width=True)
+            status_box.info("Staging and streaming 21-tab Excel & JSON with DuckDB...")
+            counts, trunc_log = transformer.transform_run(
+                run_dir=run_dir,
+                progress_callback=progress_cb,
+            )
+            progress_bar.progress(1.0)
 
-            st.markdown("### Summary")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Products", counts["Product"])
-            c2.metric("Product Rules", counts["ProductRules"])
-            c3.metric("Price Rules", counts["PriceRules"])
-            c4.metric("Summary Variables", counts["SummaryVariables"])
+            # Auto-upload to S3 if configured
+            s3_path = None
+            if config.S3_BUCKET:
+                status_box.info("Uploading to S3...")
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                key = f"extracts/{selected}/{timestamp}.json"
+                s3_path = storage.save_to_s3(data, config.S3_BUCKET, key, config.AWS_REGION)
 
-            if bundle.get("s3_path"):
-                st.caption(f"Also saved to `{bundle['s3_path']}`")
+            st.session_state.active_run_dir = run_dir
+            st.session_state.run_metadata = {
+                "instance": selected,
+                "counts": counts,
+                "s3_path": s3_path,
+                "run_dir": run_dir,
+            }
+            status_box.success("Extraction complete! Staged in run folder.")
 
-            st.markdown("### Download")
+        except Exception as e:
+            status_box.error(f"Extraction failed: {e}")
 
-            json_str = json.dumps(data, indent=2)
-            st.download_button(
-                label="⬇️ Download as JSON",
-                data=json_str,
-                file_name=f"{selected}_cpq_extract.json",
+elif not st.session_state.active_run_dir:
+    st.info("Add a Salesforce instance from the sidebar or select a saved run folder to begin.")
+
+
+# ---------------------------------------------------------------------------
+# Results & Client Document Generation View
+# ---------------------------------------------------------------------------
+active_run = st.session_state.active_run_dir
+
+if active_run and os.path.exists(active_run):
+    meta = st.session_state.run_metadata or {}
+    counts = meta.get("counts") or {}
+
+    out_json = os.path.join(active_run, "output", "cpq_extract.json")
+    out_ndjson = os.path.join(active_run, "output", "cpq_extract.ndjson")
+    out_xlsx = os.path.join(active_run, "output", "cpq_extract.xlsx")
+    doc_docx = os.path.join(active_run, "doc", "client_document.docx")
+    doc_status = os.path.join(active_run, "doc", "status.json")
+
+    # If counts not loaded, read facts or status
+    if not counts and os.path.exists(out_json):
+        from doc_gen.facts import compute_facts
+        facts = compute_facts(out_json)
+        counts = {
+            "Product": facts.get("active_products", 0),
+            "ProductRules": facts.get("product_rules", {}).get("total", 0),
+            "PriceRules": facts.get("price_rules", {}).get("total", 0),
+            "SummaryVariables": facts.get("summary_variables", {}).get("total", 0),
+            "Features": facts.get("total_features", 0),
+            "Options": facts.get("total_options", 0),
+        }
+
+    st.divider()
+    st.subheader(f"Active Run: `{os.path.basename(os.path.dirname(active_run))} / {os.path.basename(active_run)}`")
+
+    # Relationship Map
+    if counts:
+        st.markdown("### Object Relationship Map")
+        st.graphviz_chart(build_relationship_graph(counts), use_container_width=True)
+
+        st.markdown("### Catalog Summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Products", counts.get("Product", 0))
+        c2.metric("Product Rules", counts.get("ProductRules", 0))
+        c3.metric("Price Rules", counts.get("PriceRules", 0))
+        c4.metric("Summary Variables", counts.get("SummaryVariables", 0))
+
+    if meta.get("s3_path"):
+        st.caption(f"Archived to S3: `{meta['s3_path']}`")
+
+    # Raw Artifact Downloads
+    st.markdown("### Technical Downloads")
+    d_col1, d_col2 = st.columns(2)
+
+    if os.path.exists(out_json):
+        with open(out_json, "rb") as f_json:
+            d_col1.download_button(
+                label="⬇️ Download Full JSON",
+                data=f_json.read(),
+                file_name="cpq_extract.json",
                 mime="application/json",
                 use_container_width=True,
             )
 
-            # Build the workbook fresh each time — cheap relative to the
-            # Salesforce extraction itself, and avoids caching stale bytes.
-            wb = xlsx_export.build_workbook(data)
-            xlsx_buffer = io.BytesIO()
-            wb.save(xlsx_buffer)
-            xlsx_buffer.seek(0)
-            st.download_button(
-                label="⬇️ Download as Excel (21 tabs)",
-                data=xlsx_buffer,
-                file_name=f"{selected}_cpq_extract.xlsx",
+    if os.path.exists(out_xlsx):
+        with open(out_xlsx, "rb") as f_xlsx:
+            d_col2.download_button(
+                label="⬇️ Download Excel (21 Tabs)",
+                data=f_xlsx.read(),
+                file_name="cpq_extract.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+
+    # -------------------------------------------------------------
+    # CLIENT DOCUMENT GENERATION (.docx)
+    # -------------------------------------------------------------
+    st.divider()
+    st.markdown("### 📄 Executive Client Document Generator")
+    st.caption("Transforms technical CPQ rules, bundles, and pricing into a polished, non-technical Word document (.docx) for clients and executives.")
+
+    doc_col1, doc_col2 = st.columns([2, 1])
+    client_name_input = doc_col1.text_input(
+        "Client / Company Name",
+        value=meta.get("instance") or "Acme Corporation",
+        help="Appears on the document cover page and headers."
+    )
+
+    use_mock_llm = doc_col2.checkbox(
+        "Offline Mock Mode (No LLM API keys needed)",
+        value=True if not os.environ.get("LLM_API_KEY") and not os.environ.get("GEMINI_API_KEY") else False,
+        help="Uses the built-in deterministic offline engine."
+    )
+
+    include_mig_notes = doc_col2.checkbox("Include Migration Notes", value=False)
+
+    if st.button("🚀 Generate Client Document (.docx)", type="primary"):
+        doc_status_box = st.empty()
+        doc_progress_bar = st.progress(0.0)
+
+        # Launch run_document.py as subprocess
+        cmd = [
+            sys.executable,
+            "run_document.py",
+            "--run", active_run,
+            "--client-name", client_name_input,
+        ]
+        if use_mock_llm:
+            cmd.append("--mock-llm")
+        if include_mig_notes:
+            cmd.append("--include-migration-notes")
+
+        doc_status_box.info("Launching document generation engine in background...")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        # Poll status.json
+        completed = False
+        while not completed:
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                # Subprocess finished
+                completed = True
+                break
+
+            if os.path.exists(doc_status):
+                try:
+                    with open(doc_status, "r", encoding="utf-8") as sf:
+                        s_data = json.load(sf)
+                        st_state = s_data.get("state")
+                        st_step = s_data.get("current_step", "")
+                        st_prog = float(s_data.get("progress", 0.5))
+                        doc_progress_bar.progress(min(max(st_prog, 0.0), 1.0))
+                        doc_status_box.info(st_step)
+                        if st_state in ("completed", "failed"):
+                            completed = True
+                except Exception:
+                    pass
+
+        stdout, stderr = proc.communicate()
+        if proc.returncode == 0 and os.path.exists(doc_docx):
+            doc_progress_bar.progress(1.0)
+            doc_status_box.success("Client document generated successfully!")
+            st.rerun()
+        else:
+            doc_status_box.error(f"Generation failed: {stderr or stdout}")
+
+    # If client document is ready, offer download
+    if os.path.exists(doc_docx):
+        st.markdown("#### Ready for Download")
+        with open(doc_docx, "rb") as f_docx:
+            st.download_button(
+                label=f"⬇️ Download Client Document ({os.path.basename(doc_docx)})",
+                data=f_docx.read(),
+                file_name=f"{client_name_input.replace(' ', '_')}_CPQ_Overview.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+
+        val_file = os.path.join(active_run, "doc", "validation_report.json")
+        if os.path.exists(val_file):
+            with open(val_file, "r", encoding="utf-8") as f_val:
+                v_rep = json.load(f_val)
+                if v_rep.get("can_render"):
+                    st.caption("✅ Passed strict security regex check (0 Salesforce IDs or SBQQ__ tags in body text).")
+                else:
+                    st.warning("⚠️ Document contained flagged items; see validation report.")

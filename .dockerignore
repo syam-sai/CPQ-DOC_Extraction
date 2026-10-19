@@ -1,0 +1,48 @@
+# Keep the container image free of test/sample/local files.
+# Mirrors .gitignore so the ECS image only carries runtime code.
+# NOTE: the Dockerfile uses `COPY . .`, which respects this file.
+
+# Python cache / build artifacts
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Secrets — in AWS these come from task-definition env vars / Secrets Manager
+.env
+.env.*
+!.env.example
+
+# Salesforce CLI local state
+.sf/
+
+# Extraction run output (recreated at runtime in the container)
+data/
+
+# Tests
+tests/
+test_*.py
+benchmark_*.py
+
+# Sample / synthetic data fixtures and inspection helpers
+sample_extract.json
+synthetic_data.py
+setup_sample_run.py
+inspect_*.py
+
+# VCS metadata
+.git/
+.gitignore
+.gitattributes
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

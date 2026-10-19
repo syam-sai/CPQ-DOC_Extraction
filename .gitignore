@@ -1,5 +1,45 @@
-# Ignore Python cache directories and compiled bytecode
+# ---------------------------------------------------------------------------
+# Python cache / build artifacts
+# ---------------------------------------------------------------------------
 **/__pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# ---------------------------------------------------------------------------
+# Local secrets — never commit. Commit .env.example instead.
+# NOTE: .env is already tracked; run `git rm --cached .env` to untrack it.
+# ---------------------------------------------------------------------------
+.env
+
+# ---------------------------------------------------------------------------
+# Salesforce CLI local state (org auth cache, never needed by the app)
+# ---------------------------------------------------------------------------
+.sf/
+
+# ---------------------------------------------------------------------------
+# Extraction run output — contains real client catalog data per org
+# (data/runs/<org>/<timestamp>/). Recreated on every run; never commit.
+# ---------------------------------------------------------------------------
+data/
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+tests/
+test_*.py
+benchmark_*.py
+
+# ---------------------------------------------------------------------------
+# Sample / synthetic data fixtures and inspection helpers (local dev only)
+# ---------------------------------------------------------------------------
+sample_extract.json
+synthetic_data.py
+setup_sample_run.py
+inspect_*.py

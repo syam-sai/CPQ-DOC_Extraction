@@ -5,16 +5,22 @@
 #   17 child-detail sheets, each carrying explicit Parent_*_Id columns
 #
 # Rollup counts on the main sheets are real COUNTIF formulas pointing at
-# the child sheets — not hardcoded numbers — so the workbook stays correct
-# if someone edits a row by hand later. Formulas evaluate automatically
-# when the file is opened in real Excel/Google Sheets/LibreOffice; they
-# don't need to be "pre-calculated" for that to work.
+# the child sheets when Products <= 5,000 (configurable). Above that threshold,
+# pre-computed counts are written to prevent Excel performance degradation.
 
+import os
+import json
+import re
+from collections import Counter
 from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 FONT_NAME = "Arial"
+MAX_CELL_CHARS = 32767
+MAX_EXCEL_ROWS = 1048576
+DEFAULT_COUNTIF_MAX_PRODUCTS = int(os.environ.get("COUNTIF_MAX_PRODUCTS", "5000"))
 
 
 def flat_row(record, exclude):
@@ -22,14 +28,57 @@ def flat_row(record, exclude):
     return {k: v for k, v in record.items() if k not in exclude}
 
 
-def write_sheet(wb, sheet_name, rows, id_columns=None):
+def sanitize_value(val, sheet_name="", row_idx=0, col_name="", truncation_log=None):
+    """Sanitizes cell values: handles dict/list, strips illegal XML chars, truncates text > 32,767."""
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        val = json.dumps(val, default=str)
+    elif not isinstance(val, (str, int, float, bool)):
+        val = str(val)
+
+    if isinstance(val, str):
+        val = ILLEGAL_CHARACTERS_RE.sub("", val)
+        if len(val) > MAX_CELL_CHARS:
+            if truncation_log is not None:
+                truncation_log.append({
+                    "sheet": sheet_name,
+                    "row": row_idx,
+                    "column": col_name,
+                    "original_length": len(val),
+                    "truncated_length": MAX_CELL_CHARS,
+                })
+            val = val[:MAX_CELL_CHARS]
+    return val
+
+
+def get_populated_columns(rows, id_columns=None):
+    """Returns columns that have at least one non-empty value across all rows in the sheet."""
+    id_columns = id_columns or []
+    if not rows:
+        return []
+
+    active_cols = set()
+    for r in rows:
+        for k, v in r.items():
+            if v is not None and v != "":
+                active_cols.add(k)
+
+    id_cols_present = [k for k in id_columns if k in active_cols]
+    remaining = sorted(k for k in active_cols if k not in id_columns)
+    priority = [k for k in ("Id", "Name") if k in remaining]
+    others = [k for k in remaining if k not in priority]
+    return id_cols_present + priority + others
+
+
+def write_sheet(wb, sheet_name, rows, id_columns=None, truncation_log=None):
     """
-    Writes rows (list of dicts) to a new sheet. id_columns, if given, are
-    forced to appear first (in that order) — used for the normalized
-    Parent_*_Id link columns so their position is predictable for formulas.
+    Writes rows (list of dicts) to a new sheet.
+    Drops columns that are empty across all rows.
     Returns (worksheet, ordered_column_list).
     """
-    ws = wb.create_sheet(sheet_name[:31])  # Excel's 31-char tab name limit
+    clean_title = sheet_name[:31]  # Excel's 31-char tab name limit
+    ws = wb.create_sheet(clean_title)
     id_columns = id_columns or []
 
     if not rows:
@@ -37,46 +86,48 @@ def write_sheet(wb, sheet_name, rows, id_columns=None):
         ws["A1"].font = Font(name=FONT_NAME, italic=True)
         return ws, []
 
-    all_keys = set()
-    for r in rows:
-        all_keys.update(r.keys())
+    if len(rows) + 1 > MAX_EXCEL_ROWS:
+        raise ValueError(
+            f"Sheet '{sheet_name}' exceeds Excel row limit of {MAX_EXCEL_ROWS:,} rows "
+            f"({len(rows) + 1:,} rows). Split data or filter active records."
+        )
 
-    remaining = sorted(k for k in all_keys if k not in id_columns)
-    priority = [k for k in ("Id", "Name") if k in remaining]
-    others = [k for k in remaining if k not in priority]
-    columns = id_columns + priority + others
+    columns = get_populated_columns(rows, id_columns)
+    if not columns:
+        ws.append(["No populated records"])
+        ws["A1"].font = Font(name=FONT_NAME, italic=True)
+        return ws, []
 
     ws.append(columns)
     for cell in ws[1]:
         cell.font = Font(bold=True, name=FONT_NAME)
     ws.freeze_panes = "A2"
 
-    for r in rows:
-        ws.append([r.get(c, "") for c in columns])
+    for r_idx, r in enumerate(rows, start=2):
+        row_vals = [
+            sanitize_value(r.get(c, ""), clean_title, r_idx, c, truncation_log)
+            for c in columns
+        ]
+        ws.append(row_vals)
 
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = Font(name=FONT_NAME)
-
-    # reasonable default column width so sheets are readable on open
+    # Set default column width for readability based on column name length
     for i, col_name in enumerate(columns, start=1):
         ws.column_dimensions[get_column_letter(i)].width = min(max(len(str(col_name)) + 2, 12), 40)
 
     return ws, columns
 
 
-def add_rollup_column(ws, base_columns, row_count, header, target_ws_name,
-                       target_columns, target_id_field, source_id_field="Id"):
+def add_rollup_column(ws, base_columns, rows, header, target_ws_name,
+                       target_columns, target_id_field, source_id_field="Id",
+                       use_formula=True, target_rows=None):
     """
-    Appends one COUNTIF rollup column to ws, counting rows in a target
-    sheet whose target_id_field matches this row's source_id_field (Id).
-    No-ops safely if the target sheet has no data (empty columns).
+    Appends one rollup column to ws. If use_formula=True, writes COUNTIF formulas.
+    If use_formula=False, writes computed values and appends '(computed)' to header.
     """
     if not target_columns or target_id_field not in target_columns or source_id_field not in base_columns:
-        return  # nothing to link — leave the rollup out rather than write a broken formula
+        return  # nothing to link
 
     new_col_index = len(base_columns) + 1
-    # account for rollups already added in this call sequence
     while ws.cell(row=1, column=new_col_index).value not in (None, ""):
         new_col_index += 1
 
@@ -84,15 +135,28 @@ def add_rollup_column(ws, base_columns, row_count, header, target_ws_name,
     source_col_letter = get_column_letter(base_columns.index(source_id_field) + 1)
     target_col_letter = get_column_letter(target_columns.index(target_id_field) + 1)
 
-    ws.cell(row=1, column=new_col_index, value=header).font = Font(bold=True, name=FONT_NAME)
-    for r in range(2, row_count + 2):
-        formula = f"=COUNTIF('{target_ws_name}'!{target_col_letter}:{target_col_letter},{source_col_letter}{r})"
-        ws.cell(row=r, column=new_col_index, value=formula).font = Font(name=FONT_NAME)
+    display_header = header if use_formula else f"{header} (computed)"
+    ws.cell(row=1, column=new_col_index, value=display_header).font = Font(bold=True, name=FONT_NAME)
 
-    ws.column_dimensions[col_letter].width = max(len(header) + 2, 14)
+    if use_formula:
+        for r in range(2, len(rows) + 2):
+            formula = f"=COUNTIF('{target_ws_name}'!{target_col_letter}:{target_col_letter},{source_col_letter}{r})"
+            ws.cell(row=r, column=new_col_index, value=formula)
+    else:
+        counts = Counter()
+        if target_rows:
+            for tr in target_rows:
+                tid = tr.get(target_id_field)
+                if tid:
+                    counts[tid] += 1
+        for r_idx, r in enumerate(rows, start=2):
+            sid = r.get(source_id_field)
+            ws.cell(row=r_idx, column=new_col_index, value=counts.get(sid, 0))
+
+    ws.column_dimensions[col_letter].width = max(len(display_header) + 2, 14)
 
 
-def build_workbook(data):
+def build_workbook(data, truncation_log=None, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS):
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -189,12 +253,15 @@ def build_workbook(data):
     summary_var_rows = data.get("SummaryVariables", [])
     config_rules_final = list(config_rules_by_id.values())
 
+    # Determine whether to use COUNTIF formula or computed values based on product count
+    use_formulas = len(product_rows) <= countif_max_products
+
     # ---------------- Write child sheets first (main sheets need their column layouts) ----------------
     child = {}
 
     def add_child(name, rows, id_cols):
-        ws, cols = write_sheet(wb, name, rows, id_columns=id_cols)
-        child[name] = (ws, cols)
+        ws, cols = write_sheet(wb, name, rows, id_columns=id_cols, truncation_log=truncation_log)
+        child[name] = (ws, cols, rows)
 
     add_child("Features", features_rows, ["Parent_Product_Id"])
     add_child("Options", options_rows, ["Parent_Product_Id", "Parent_Feature_Id"])
@@ -215,51 +282,55 @@ def build_workbook(data):
     add_child("Price Rule Lookup Queries", prc_lookup_rows, ["Parent_Rule_Id"])
 
     # ---------------- Main sheets with rollup formulas ----------------
-    products_ws, products_cols = write_sheet(wb, "Products", product_rows, id_columns=[])
-    n = len(product_rows)
+    products_ws, products_cols = write_sheet(wb, "Products", product_rows, id_columns=[], truncation_log=truncation_log)
     for header, target_name, target_id_field in [
         ("Feature Count", "Features", "Parent_Product_Id"),
         ("Option Count", "Options", "Parent_Product_Id"),
         ("Configuration Rule Count", "Configuration Rules", "Parent_Product_Id"),
-        ("Price Rule Count (scoped)", "Price Rules", "Parent_Product_Id"),
         ("Pricebook Entry Count", "Pricebook Entries", "Parent_Product_Id"),
     ]:
-        # "Price Rules" isn't in `child` (it's a main sheet, written after this) —
-        # handled separately below once that sheet exists.
         if target_name in child:
-            t_ws, t_cols = child[target_name]
-            add_rollup_column(products_ws, products_cols, n, header, target_name, t_cols, target_id_field)
+            t_ws, t_cols, t_rows = child[target_name]
+            add_rollup_column(
+                products_ws, products_cols, product_rows, header, target_name,
+                t_cols, target_id_field, use_formula=use_formulas, target_rows=t_rows
+            )
 
-    product_rules_ws, product_rules_cols = write_sheet(wb, "Product Rules", product_rule_rows, id_columns=[])
-    n = len(product_rule_rows)
+    product_rules_ws, product_rules_cols = write_sheet(wb, "Product Rules", product_rule_rows, id_columns=[], truncation_log=truncation_log)
     for header, target_name, target_id_field in [
         ("Error Condition Count", "Error Conditions", "Parent_Rule_Id"),
         ("Product Action Count", "Product Actions", "Parent_Rule_Id"),
         ("Configuration Rule Count", "Configuration Rules", "Parent_Rule_Id"),
         ("Lookup Query Count", "Product Rule Lookup Queries", "Parent_Rule_Id"),
     ]:
-        t_ws, t_cols = child[target_name]
-        add_rollup_column(product_rules_ws, product_rules_cols, n, header, target_name, t_cols, target_id_field)
+        t_ws, t_cols, t_rows = child[target_name]
+        add_rollup_column(
+            product_rules_ws, product_rules_cols, product_rule_rows, header, target_name,
+            t_cols, target_id_field, use_formula=True, target_rows=t_rows
+        )
 
-    price_rules_ws, price_rules_cols = write_sheet(wb, "Price Rules", price_rule_rows, id_columns=["Parent_Product_Id"])
-    n = len(price_rule_rows)
+    price_rules_ws, price_rules_cols = write_sheet(wb, "Price Rules", price_rule_rows, id_columns=["Parent_Product_Id"], truncation_log=truncation_log)
     for header, target_name, target_id_field in [
         ("Price Condition Count", "Price Conditions", "Parent_Rule_Id"),
         ("Price Action Count", "Price Actions", "Parent_Rule_Id"),
         ("Lookup Query Count", "Price Rule Lookup Queries", "Parent_Rule_Id"),
     ]:
-        t_ws, t_cols = child[target_name]
-        add_rollup_column(price_rules_ws, price_rules_cols, n, header, target_name, t_cols, target_id_field)
+        t_ws, t_cols, t_rows = child[target_name]
+        add_rollup_column(
+            price_rules_ws, price_rules_cols, price_rule_rows, header, target_name,
+            t_cols, target_id_field, use_formula=True, target_rows=t_rows
+        )
 
-    # Now that "Price Rules" exists, go back and add its rollup onto Products
-    if "Price Rule Count (scoped)" not in [c.value for c in products_ws[1]]:
-        n = len(product_rows)
-        add_rollup_column(products_ws, products_cols, n, "Price Rule Count (scoped)",
-                           "Price Rules", price_rules_cols, "Parent_Product_Id")
+    # Scoped price rules rollup onto Products
+    add_rollup_column(
+        products_ws, products_cols, product_rows, "Price Rule Count (scoped)",
+        "Price Rules", price_rules_cols, "Parent_Product_Id",
+        use_formula=use_formulas, target_rows=price_rule_rows
+    )
 
-    write_sheet(wb, "Summary Variables", summary_var_rows, id_columns=[])
+    write_sheet(wb, "Summary Variables", summary_var_rows, id_columns=[], truncation_log=truncation_log)
 
-    # Put the 4 main sheets first, in a sensible reading order
+    # Put the 4 main sheets first, in sensible reading order
     main_order = ["Products", "Product Rules", "Price Rules", "Summary Variables"]
     by_title = {ws.title: ws for ws in wb.worksheets}
     ordered = [by_title[name] for name in main_order if name in by_title]
@@ -269,7 +340,9 @@ def build_workbook(data):
     return wb
 
 
-def save_workbook(data, filepath):
-    wb = build_workbook(data)
+def save_workbook(data, filepath, truncation_log=None, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS):
+    """Builds and saves the 21-tab workbook to filepath."""
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    wb = build_workbook(data, truncation_log=truncation_log, countif_max_products=countif_max_products)
     wb.save(filepath)
     return filepath
