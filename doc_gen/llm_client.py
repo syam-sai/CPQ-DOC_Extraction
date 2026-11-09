@@ -38,17 +38,27 @@ class MockLLMClient(LLMClient):
 
     def generate(self, system: str, user: str, max_tokens: int = 2500, model: str = None) -> str:
         # Check if this is a packet analysis call or a synthesis call
+        user_data = {}
         try:
             user_data = json.loads(user)
         except Exception:
-            user_data = {}
+            # Extract JSON packet if wrapped in prompt template
+            idx_start = user.find("PACKET:\n")
+            if idx_start != -1:
+                idx_start += len("PACKET:\n")
+                idx_end = user.find("\n\nReturn JSON", idx_start)
+                json_str = user[idx_start:idx_end].strip() if idx_end != -1 else user[idx_start:].strip()
+                try:
+                    user_data = json.loads(json_str)
+                except Exception:
+                    pass
 
         packet_type = user_data.get("packet_type")
 
         # 1. Product Rule Analysis
         if packet_type == "product_rule":
             name = user_data.get("rule_name", "Product Rule")
-            rtype = user_data.get("rule_type", "Validation").lower()
+            rtype = str(user_data.get("rule_type", "Validation")).lower()
             kind_map = {
                 "validation": "validation",
                 "selection": "selection",
@@ -57,11 +67,12 @@ class MockLLMClient(LLMClient):
             }
             kind = kind_map.get(rtype, "validation")
             err_msg = user_data.get("error_message_shown_to_user")
+            bundles = user_data.get("applies_to_bundles", [])
+            conditions = user_data.get("conditions", [])
+            actions = user_data.get("actions", [])
 
-            related_items = []
-            for b in user_data.get("applies_to_bundles", []):
-                related_items.append(b)
-            for a in user_data.get("actions", []):
+            related_items = list(bundles)
+            for a in actions:
                 t_prod = a.get("target_product_name")
                 if t_prod and t_prod not in related_items:
                     related_items.append(t_prod)
@@ -69,23 +80,62 @@ class MockLLMClient(LLMClient):
                 if sv not in related_items:
                     related_items.append(sv)
 
-            cond_count = len(user_data.get("conditions", []))
+            # Build human-readable conditions description
+            cond_clauses = []
+            for c in conditions:
+                target = c.get("tested_target", "").replace("__c", "").replace("_", " ")
+                op = c.get("comparison_operator", "equals")
+                val = c.get("target_value", "")
+                cond_clauses.append(f"{target} {op} '{val}'")
+
+            if cond_clauses:
+                when_it_applies = f"Applies when {' and '.join(cond_clauses)}"
+                if bundles:
+                    when_it_applies += f" while configuring {', '.join(bundles)}."
+                else:
+                    when_it_applies += "."
+            elif bundles:
+                when_it_applies = f"Applies when sales representatives configure {', '.join(bundles)}."
+            else:
+                when_it_applies = f"Evaluates during the quote configuration event ({user_data.get('evaluation_event', 'Always')})."
+
+            # Build human-readable action description
+            if kind == "validation":
+                what_it_does = f"Blocks quote progression and displays message: '{err_msg}'" if err_msg else "Validates inputs and prevents quote save if configuration rules are violated."
+                one_line_summary = f"Prevents invalid configuration selections on {', '.join(bundles) if bundles else name}."
+            elif kind == "selection":
+                act_descriptions = []
+                for a in actions:
+                    act_t = a.get("action_type", "Update")
+                    prod_n = a.get("target_product_name", "component")
+                    mand = " as mandatory" if a.get("required") else ""
+                    act_descriptions.append(f"{act_t.lower()}s '{prod_n}'{mand}")
+                what_it_does = f"Automatically {', and '.join(act_descriptions)} based on option selections." if act_descriptions else "Automatically updates selectable component options in the bundle."
+                one_line_summary = f"Automated component selection rule for {', '.join(bundles) if bundles else name}."
+            elif kind == "alert":
+                what_it_does = f"Displays alert warning to sales representatives: '{err_msg}'" if err_msg else "Displays configuration alerts to guide reps."
+                one_line_summary = f"Provides guided sales alerts during {', '.join(bundles) if bundles else name} configuration."
+            else:
+                what_it_does = "Filters available bundle options to match customer criteria."
+                one_line_summary = f"Filters catalog options for {', '.join(bundles) if bundles else name}."
+
+            cond_count = len(conditions)
             complexity = "low" if cond_count <= 1 else ("medium" if cond_count <= 3 else "high")
 
             resp = {
                 "name": name,
                 "kind": kind,
-                "one_line_summary": f"Business {kind} rule enforcing configuration standards during quote creation.",
-                "when_it_applies": f"Applies when a sales representative configures {' or '.join(user_data.get('applies_to_bundles', ['products']))}.",
-                "what_it_does": f"Evaluates {cond_count} criteria and {('displays an alert message' if kind in ('validation', 'alert') else 'automatically updates selectable options')}.",
+                "one_line_summary": one_line_summary,
+                "when_it_applies": when_it_applies,
+                "what_it_does": what_it_does,
                 "message_shown_to_user": err_msg,
                 "related_items": related_items,
-                "inferred_purpose": f"Appears to ensure quote configurations remain technically feasible and compliant with standard sales packages.",
+                "inferred_purpose": "Appears to ensure quote configurations remain compliant with commercial packaging standards and prevent unfulfillable orders.",
                 "complexity": complexity,
-                "complexity_reason": f"Evaluates {cond_count} condition(s) with {len(user_data.get('actions', []))} automated action(s).",
+                "complexity_reason": f"Evaluates {cond_count} condition(s) with {len(actions)} automated action(s).",
                 "questions_to_confirm": [
-                    f"Should this rule apply globally or remain restricted to {', '.join(user_data.get('applies_to_bundles', ['selected bundles']))}?",
-                    "Are there exception scenarios where sales representatives should be allowed to bypass this constraint?"
+                    f"Should '{name}' apply across all quote types (new, amendment, renewal)?",
+                    f"Should sales managers have authority to override this {kind} rule under special approvals?"
                 ],
                 "data_gaps": []
             }
@@ -94,23 +144,56 @@ class MockLLMClient(LLMClient):
         # 2. Price Rule Analysis
         elif packet_type == "price_rule":
             name = user_data.get("rule_name", "Price Rule")
+            conditions = user_data.get("conditions", [])
+            actions = user_data.get("actions", [])
+
+            cond_clauses = [f"{str(c.get('field', '')).replace('SBQQ__', '').replace('__c', '').replace('_', ' ')} {c.get('operator')} '{c.get('value')}'" for c in conditions if c.get("field")]
+            if cond_clauses:
+                when_it_applies = f"Evaluated when {', '.join(cond_clauses)} during the quote calculation cycle ({user_data.get('evaluation_event', 'On Calculate')})."
+            else:
+                when_it_applies = f"Triggered automatically during the quote calculation cycle ({user_data.get('evaluation_event', 'On Calculate')})."
+
+            act_clauses = []
+            for a in actions:
+                f_name = str(a.get("target_field", "pricing")).replace("SBQQ__", "").replace("__c", "").replace("_", " ")
+                t_obj = a.get("target_object", "Quote Line")
+                act_clauses.append(f"calculates {f_name} on {t_obj}")
+
+            n_low = name.lower()
+            if "employee count" in n_low or "list price" in n_low:
+                summary = "Dynamically calculates subscription List Price scaled to customer employee headcount."
+                what_it_does = "Calculates the base List Price for training subscriptions based on the customer's employee tier (configured in bundle attributes)."
+                intent = "Appears to implement headcount-based value pricing so contract pricing scales proportionally with organization size."
+            elif "discount" in n_low:
+                tier = "Starter" if "starter" in n_low else ("Professional" if "professional" in n_low else "package")
+                summary = f"Automatically calculates and applies standard package discounts to the {tier} subscription."
+                what_it_does = f"Applies approved formula discount percentage directly to the {tier} subscription quote line across calculation events."
+                intent = "Appears to automate approved bundle discounting to protect commercial margins while streamlining quote delivery."
+            else:
+                summary = "Calculates automated pricing adjustments on quote lines during calculation."
+                what_it_does = f"Automatically {', and '.join(act_clauses)} using formula-driven pricing logic." if act_clauses else "Calculates pricing adjustments across targeted quote line items."
+                intent = "Appears to automate approved discount structures and formula-based pricing rules without requiring manual calculation by sales reps."
+
+            related_items = [str(c.get("value")) for c in conditions if c.get("field") == "Product Code" and c.get("value")]
+            if user_data.get("scoped_to_product"):
+                related_items.append(user_data.get("scoped_to_product"))
+
             resp = {
                 "name": name,
                 "kind": "price",
-                "one_line_summary": "Automated pricing rule that calculates dynamic discounts or overrides standard pricing.",
-                "when_it_applies": f"Triggered during the quote calculation cycle ({user_data.get('evaluation_event', 'On Calculate')}).",
-                "what_it_does": "Calculates pricing adjustments across targeted quote line items based on configured criteria.",
+                "one_line_summary": summary,
+                "when_it_applies": when_it_applies,
+                "what_it_does": what_it_does,
                 "message_shown_to_user": None,
-                "related_items": [user_data.get("scoped_to_product")] if user_data.get("scoped_to_product") else [],
-                "inferred_purpose": "Appears to automate pricing rules to ensure approved pricing models are applied consistently.",
-                "complexity": "low" if len(user_data.get("conditions", [])) <= 1 else "medium",
-                "complexity_reason": "Automated pricing calculation rule.",
+                "related_items": list(set(related_items)),
+                "inferred_purpose": intent,
+                "complexity": "low" if len(conditions) <= 1 else "medium",
+                "complexity_reason": f"Evaluates {len(conditions)} condition(s) and executes {len(actions)} pricing action(s).",
                 "questions_to_confirm": [
-                    "Is this pricing logic intended to operate automatically or should sales reps have override authority?"
+                    f"Verify whether the pricing adjustments in '{name}' should apply to both new business and contract renewals.",
+                    "Should sales representatives have discretion to apply additional manual discounts on top of this rule?"
                 ],
-                "data_gaps": [
-                    "No explicit conditions configured; relies on system calculation events."
-                ] if not user_data.get("conditions") else []
+                "data_gaps": []
             }
             return json.dumps(resp, indent=2)
 
@@ -122,11 +205,11 @@ class MockLLMClient(LLMClient):
             related_items = []
 
             for f in features:
-                f_name = f.get("feature_name", "Options")
+                f_name = f.get("feature_name", "Components")
                 opt_names = [o.get("component_name") for o in f.get("options", []) if o.get("component_name")]
                 choices.append({
                     "feature": f_name,
-                    "what_customer_chooses": f"Selects components for {f_name.lower()}.",
+                    "what_customer_chooses": f"Selects components and options for {f_name}.",
                     "option_names": opt_names
                 })
                 related_items.extend(opt_names)
@@ -136,20 +219,21 @@ class MockLLMClient(LLMClient):
 
             total_opts = sum(len(c["option_names"]) for c in choices) + len(ungrouped)
             complexity = "low" if total_opts <= 4 else ("medium" if total_opts <= 10 else "high")
+            sku = user_data.get("sku", "")
 
             resp = {
                 "name": name,
-                "one_line_summary": f"Configurable {user_data.get('family', 'catalog')} product bundle offering {total_opts} customizable components.",
-                "how_it_is_sold": f"Sold as a base product with {len(features)} customizable feature section(s).",
+                "one_line_summary": f"Configurable {user_data.get('family', 'software')} bundle ({sku}) featuring {len(features)} feature section(s) and {total_opts} customizable components.",
+                "how_it_is_sold": f"Sold as a core package ({sku}) with guided component selections and automated rule governance.",
                 "choices_offered": choices,
                 "ungrouped_options": ungrouped,
-                "rules_that_affect_it": user_data.get("affecting_rules", []),
-                "pricing_notes": "Standard package pricing applies based on the selected component quantities.",
+                "rules_that_affect_it": [r.replace("Product Rule: ", "").replace("Price Rule: ", "") for r in user_data.get("affecting_rules", [])],
+                "pricing_notes": "Base package priced via standard price book with add-on options priced according to selected component terms.",
                 "complexity": complexity,
                 "complexity_reason": f"Contains {len(features)} feature section(s) with {total_opts} selectable option(s).",
                 "questions_to_confirm": [
-                    f"Are all {total_opts} component options actively stocked and sold today?",
-                    "Should default quantities be pre-selected to accelerate the quotation flow?"
+                    f"Are all {total_opts} component options within '{name}' actively sold and supported today?",
+                    "Should default quantities and selections be pre-populated to streamline quoting for sales reps?"
                 ],
                 "data_gaps": []
             }
@@ -169,13 +253,37 @@ class MockLLMClient(LLMClient):
 
         # 5. Synthesis Call (Executive Summary or Section Summary)
         else:
-            # Check if this is the Executive Summary synthesis
-            if "Executive Summary" in user or "executive" in user.lower():
+            u_low = user.lower()
+            if "executive summary" in u_low or "executive" in u_low:
                 resp = {
                     "paragraphs": [
                         "This document provides an executive summary of your Salesforce CPQ configuration. The catalog comprises {{active_products}} active products, designed to streamline how your sales representatives quote complex products and services.",
                         "Within the catalog, {{total_bundles}} products are structured as configurable bundles containing {{total_features}} feature categories and {{total_options}} selectable components. An additional {{standalone_products}} products are offered as standalone items.",
                         "Configuration integrity is protected by {{product_rules_total}} automated product rules and {{price_rules_total}} price rules. These rules prevent incompatible component selections and ensure pricing accuracy across every quote."
+                    ]
+                }
+                return json.dumps(resp, indent=2)
+            elif "bundle" in u_low:
+                resp = {
+                    "paragraphs": [
+                        "The commercial catalog structures products into {{total_bundles}} configurable bundle packages alongside {{standalone_products}} standalone items sold directly without sub-components.",
+                        "Each bundle guides sales representatives through {{total_features}} structured feature categories containing {{total_options}} selectable component options, ensuring technical compatibility and preventing quote errors."
+                    ]
+                }
+                return json.dumps(resp, indent=2)
+            elif "rule" in u_low:
+                resp = {
+                    "paragraphs": [
+                        "Product rules and price rules automate quotation governance and commercial calculations across the CPQ platform.",
+                        "The catalog is governed by {{product_rules_total}} product rules (enforcing validation limits and automatic component selection) alongside {{price_rules_total}} price rules that dynamically calculate list prices and package discounts."
+                    ]
+                }
+                return json.dumps(resp, indent=2)
+            elif "pricing" in u_low or "price" in u_low:
+                resp = {
+                    "paragraphs": [
+                        "Salesforce CPQ supports flexible monetization models across standard and dynamic catalog structures.",
+                        "Commercial pricing is driven by {{total_pricebook_entries}} price book entries across {{total_pricebooks}} active price books, complemented by automated price rules that calculate volume discounts and contract term adjustments."
                     ]
                 }
                 return json.dumps(resp, indent=2)

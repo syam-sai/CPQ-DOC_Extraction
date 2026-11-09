@@ -153,7 +153,7 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     sub_p = doc.add_paragraph()
     sub_p.paragraph_format.space_before = Pt(4)
     sub_p.paragraph_format.space_after = Pt(40)
-    r_sub = sub_p.add_run("Executive Commercial Architecture, Bundle Structures, and Business Rule Reference")
+    r_sub = sub_p.add_run("Executive Commercial Architecture, Bundle Structures, Product Rules, and Price Rules Reference")
     r_sub.font.size = Pt(13)
     r_sub.font.color.rgb = COLOR_SECONDARY
 
@@ -402,19 +402,35 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
         doc.add_paragraph().paragraph_format.space_after = Pt(6)
 
     # -------------------------------------------------------------
-    # SECTION 5: BUSINESS RULES IN PLAIN ENGLISH
+    # SECTION 5: PRODUCT RULES AND PRICE RULES IN PLAIN ENGLISH
     # -------------------------------------------------------------
-    doc.add_heading("5. Business Rules in Plain English", level=1)
+    doc.add_heading("5. Product Rules and Price Rules in Plain English", level=1)
     doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
 
     for p_text in sections.get("rules_introduction", []):
         doc.add_paragraph(p_text).paragraph_format.space_after = Pt(6)
 
-    for r in sections.get("rule_analyses", []):
-        r_name = r.get("name", "Business Rule")
-        r_kind = (r.get("kind") or "Rule").capitalize()
-        doc.add_heading(f"{r_name} ({r_kind})", level=2)
-        doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
+    prod_rules = sections.get("product_rule_analyses")
+    if not prod_rules:
+        prod_rules = [r for r in sections.get("rule_analyses", []) if r.get("kind") != "price"]
+
+    price_rules = sections.get("price_rule_analyses")
+    if not price_rules:
+        price_rules = [r for r in sections.get("rule_analyses", []) if r.get("kind") == "price"]
+
+    # --- Part A: Product Rules ---
+    doc.add_heading("Product Rules", level=2)
+    doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
+    doc.add_paragraph(
+        "Product rules safeguard configuration integrity by validating sales selections, "
+        "preventing incompatible combinations, and automatically adding or removing required components:"
+    ).paragraph_format.space_after = Pt(6)
+
+    for r in prod_rules:
+        r_name = r.get("name", "Product Rule")
+        r_kind = (r.get("kind") or "Validation").capitalize()
+        doc.add_heading(f"{r_name} ({r_kind})", level=3)
+        doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
 
         doc.add_paragraph(f"Overview: {r.get('one_line_summary', '')}").paragraph_format.space_after = Pt(3)
         doc.add_paragraph(f"When it triggers: {r.get('when_it_applies', '')}").paragraph_format.space_after = Pt(3)
@@ -431,6 +447,32 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
             doc.add_paragraph(f"Related Catalog Items: {', '.join(r['related_items'])}").paragraph_format.space_after = Pt(3)
 
         doc.add_paragraph().paragraph_format.space_after = Pt(8)
+
+    # --- Part B: Price Rules ---
+    if price_rules:
+        doc.add_heading("Price Rules", level=2)
+        doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
+        doc.add_paragraph(
+            "Price rules automate quotation math by dynamically calculating list prices "
+            "and applying approved package discounts during quote calculation cycles:"
+        ).paragraph_format.space_after = Pt(6)
+
+        for pr in price_rules:
+            pr_name = pr.get("name", "Price Rule")
+            doc.add_heading(f"{pr_name}", level=3)
+            doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
+
+            doc.add_paragraph(f"Commercial Impact: {pr.get('one_line_summary', '')}").paragraph_format.space_after = Pt(3)
+            doc.add_paragraph(f"Calculation Trigger: {pr.get('when_it_applies', '')}").paragraph_format.space_after = Pt(3)
+            doc.add_paragraph(f"Pricing Formula & Behavior: {pr.get('what_it_does', '')}").paragraph_format.space_after = Pt(3)
+
+            if pr.get("inferred_purpose"):
+                doc.add_paragraph(f"Business Intent: {pr['inferred_purpose']}").paragraph_format.space_after = Pt(3)
+
+            if pr.get("related_items"):
+                doc.add_paragraph(f"Catalog Products Affected: {', '.join(pr['related_items'])}").paragraph_format.space_after = Pt(3)
+
+            doc.add_paragraph().paragraph_format.space_after = Pt(8)
 
     # -------------------------------------------------------------
     # SECTION 6: HOW PRICING WORKS
@@ -465,6 +507,38 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
         set_cell_margins(row.cells[1], 60, 60, 120, 120)
         row.cells[0].paragraphs[0].add_run(m_name).bold = True
         row.cells[1].paragraphs[0].add_run(m_desc)
+
+    doc.add_paragraph().paragraph_format.space_after = Pt(10)
+
+    # Detailed Automated Dynamic Pricing Rules
+    price_rules = sections.get("price_rule_analyses", [])
+    if not price_rules:
+        price_rules = [r for r in sections.get("rule_analyses", []) if r.get("kind") == "price"]
+
+    if price_rules:
+        doc.add_heading("Automated Dynamic Pricing Rules", level=2)
+        doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
+        doc.add_paragraph(
+            "In addition to standard price book rates, your catalog enforces dynamic pricing through automated price rules. "
+            "These rules eliminate manual calculation errors by evaluating quote lines in real time during the quotation cycle:"
+        ).paragraph_format.space_after = Pt(6)
+
+        for pr in price_rules:
+            pr_name = pr.get("name", "Pricing Rule")
+            doc.add_heading(f"{pr_name}", level=3)
+            doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
+
+            doc.add_paragraph(f"Commercial Impact: {pr.get('one_line_summary', '')}").paragraph_format.space_after = Pt(3)
+            doc.add_paragraph(f"Calculation Trigger: {pr.get('when_it_applies', '')}").paragraph_format.space_after = Pt(3)
+            doc.add_paragraph(f"Pricing Behavior & Formula: {pr.get('what_it_does', '')}").paragraph_format.space_after = Pt(3)
+
+            if pr.get("inferred_purpose"):
+                doc.add_paragraph(f"Business Intent: {pr['inferred_purpose']}").paragraph_format.space_after = Pt(3)
+
+            if pr.get("related_items"):
+                doc.add_paragraph(f"Catalog Products Affected: {', '.join(pr['related_items'])}").paragraph_format.space_after = Pt(3)
+
+            doc.add_paragraph().paragraph_format.space_after = Pt(8)
 
     doc.add_paragraph().paragraph_format.space_after = Pt(12)
 
@@ -507,8 +581,9 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
 
     all_questions = []
     for r in sections.get("rule_analyses", []):
+        r_type = "Price Rule" if r.get("kind") == "price" else "Product Rule"
         for q in r.get("questions_to_confirm", []):
-            all_questions.append((f"Rule: {r.get('name')}", q))
+            all_questions.append((f"{r_type}: {r.get('name')}", q))
 
     for b in sections.get("bundle_analyses", []):
         for q in b.get("questions_to_confirm", []):

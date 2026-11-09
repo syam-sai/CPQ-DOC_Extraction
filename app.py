@@ -204,6 +204,19 @@ if selected and selected in st.session_state.instances:
     st.caption(f"Auth: `{method_display}` · Domain: `{instance['domain']}`")
 
     if st.button("🔌 Connect & Extract Data", type="primary"):
+        import importlib
+        import extractor
+        import transformer
+        import sf_auth
+        importlib.reload(extractor)
+        importlib.reload(transformer)
+        importlib.reload(sf_auth)
+
+        # Force clear all in-memory caches and session state for a 100% fresh run
+        extractor.clear_describe_cache()
+        st.session_state.active_run_dir = None
+        st.session_state.run_metadata = {}
+
         status_box = st.empty()
         progress_bar = st.progress(0.0)
 
@@ -226,6 +239,7 @@ if selected and selected in st.session_state.instances:
                 progress_callback=progress_cb,
                 run_dir=run_dir,
                 extract_log=extract_log,
+                force_fresh=True,
             )
             progress_bar.progress(0.6)
 

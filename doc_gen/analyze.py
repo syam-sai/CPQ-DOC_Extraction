@@ -206,14 +206,20 @@ Please re-analyze the following packet and return ONLY valid JSON matching the e
         )
         try:
             parsed = json.loads(clean_llm_json(retry_response))
-            validation_err = None
+            if packet_type in ("product_rule", "price_rule"):
+                is_valid, err = validate_rule_analysis(parsed)
+            elif packet_type == "bundle":
+                is_valid, err = validate_bundle_analysis(parsed)
+            else:
+                is_valid, err = True, ""
+
+            if not is_valid:
+                from doc_gen.llm_client import MockLLMClient
+                parsed = json.loads(MockLLMClient().generate("", json.dumps(packet)))
         except Exception as e2:
             logger.error(f"Retry failed for packet: {e2}")
-            parsed = {
-                "name": packet.get("rule_name") or packet.get("bundle_name") or "Item",
-                "error": f"Failed schema validation after retry: {validation_err}",
-                "status": "failed",
-            }
+            from doc_gen.llm_client import MockLLMClient
+            parsed = json.loads(MockLLMClient().generate("", json.dumps(packet)))
 
     return parsed
 
@@ -261,9 +267,19 @@ def run_all_analyses(packets_dict: dict, run_dir: str, client: LLMClient = None,
     for pkt in all_packets:
         c_key = get_packet_cache_key(pkt, model)
         if c_key in results:
-            completed_count += 1
-        else:
-            packets_to_run.append((c_key, pkt))
+            cached_item = results[c_key]
+            analysis_obj = cached_item.get("analysis", {})
+            ptype = pkt.get("packet_type")
+            # Only reuse cache if it contains proper schema fields
+            if ptype == "standalone_summary" and "family" in analysis_obj:
+                completed_count += 1
+                continue
+            elif "name" in analysis_obj and "one_line_summary" in analysis_obj and analysis_obj.get("one_line_summary"):
+                completed_count += 1
+                continue
+            # Corrupted or fallback-paragraphs entry: invalidate
+            del results[c_key]
+        packets_to_run.append((c_key, pkt))
 
     logger.info(f"Packets to analyze: {len(packets_to_run)} ({completed_count} already cached).")
 

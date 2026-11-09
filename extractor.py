@@ -37,10 +37,12 @@ _describe_cache = {}
 
 
 def get_object_describe(sf, object_name):
-    """Caches describe() per object to prevent duplicate API calls."""
-    if object_name not in _describe_cache:
-        _describe_cache[object_name] = getattr(sf, object_name).describe()
-    return _describe_cache[object_name]
+    """Caches describe() per object and Salesforce session to prevent cross-org leaks."""
+    session_key = getattr(sf, "session_id", id(sf))
+    cache_key = (session_key, object_name)
+    if cache_key not in _describe_cache:
+        _describe_cache[cache_key] = getattr(sf, object_name).describe()
+    return _describe_cache[cache_key]
 
 
 def clear_describe_cache():
@@ -137,13 +139,13 @@ def _run_soql_chunks(sf, object_name, fields, where_clause=None):
     return list(merged.values())
 
 
-def query_table(sf, object_name, where_clause=None, raw_path=None, use_bulk=False, extract_log=None):
+def query_table(sf, object_name, where_clause=None, raw_path=None, use_bulk=False, extract_log=None, force_fresh=True):
     """
     Safely queries an object with caching, semi-join server filtering,
     Bulk 2.0 with REST fallback, and error handling.
     """
     # 1. Check if raw CSV already exists (resumption support)
-    if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+    if not force_fresh and raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
         try:
             records = read_records_from_csv(raw_path)
             if extract_log is not None:
@@ -177,17 +179,27 @@ def query_table(sf, object_name, where_clause=None, raw_path=None, use_bulk=Fals
         except Exception as bulk_err:
             logger.warning(f"Bulk 2.0 query for {object_name} failed: {bulk_err}. Falling back to REST.")
 
-    # 3. REST query with try/except and semi-join fallback
+    # 3. REST query with try/except, missing column auto-recovery, and semi-join fallback
     try:
         fields = get_queryable_fields(sf, object_name)
-        try:
-            records = _run_soql_chunks(sf, object_name, fields, where_clause=where_clause)
-        except Exception as q_err:
-            # If semi-join was rejected, fall back to querying without where_clause
-            if where_clause and ("MALFORMED_QUERY" in str(q_err) or "Semi join subselects" in str(q_err)):
-                logger.warning(f"Semi-join on {object_name} failed: {q_err}. Falling back to unjoined query.")
-                records = _run_soql_chunks(sf, object_name, fields, where_clause=None)
-            else:
+        max_field_retries = 10
+        records = None
+        for _ in range(max_field_retries):
+            try:
+                records = _run_soql_chunks(sf, object_name, fields, where_clause=where_clause)
+                break
+            except Exception as q_err:
+                err_str = str(q_err)
+                missing_cols = set(re.findall(r"No such column '([^']+)'", err_str))
+                bad_in_fields = [c for c in missing_cols if c in fields]
+                if bad_in_fields:
+                    logger.warning(f"Removing nonexistent columns {bad_in_fields} from {object_name} query and retrying.")
+                    fields = [f for f in fields if f not in missing_cols]
+                    continue
+                if where_clause and ("MALFORMED_QUERY" in err_str or "Semi join subselects" in err_str):
+                    logger.warning(f"Semi-join on {object_name} failed: {q_err}. Falling back to unjoined query.")
+                    records = _run_soql_chunks(sf, object_name, fields, where_clause=None)
+                    break
                 raise
 
         if raw_path:
@@ -224,11 +236,12 @@ def group_by_fk(records, fk_field, valid_parent_ids=None):
     return grouped
 
 
-def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extract_log=None):
+def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extract_log=None, force_fresh=True):
     """
     Extracts all active CPQ configuration.
     Returns (data, counts, extract_log).
     """
+    clear_describe_cache()
     if extract_log is None:
         extract_log = {}
 
@@ -248,6 +261,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause=f"{PRODUCT_ACTIVE_FIELD} = true",
         raw_path=raw_file("Product2"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     product_ids = set(p["Id"] for p in products)
@@ -259,6 +273,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="Product2Id IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("PricebookEntry"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     block_prices_raw = query_table(
@@ -266,6 +281,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__BlockPrice__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     costs_raw = query_table(
@@ -273,6 +289,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__Cost__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     dimensions_raw = query_table(
@@ -280,6 +297,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__Dimension__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     discount_schedules_raw = query_table(
@@ -287,6 +305,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__DiscountSchedule__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     price_schedules_raw = query_table(
@@ -294,6 +313,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__PriceSchedule__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     features_raw = query_table(
@@ -301,6 +321,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__ConfiguredSKU__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__ProductFeature__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     options_raw = query_table(
@@ -308,6 +329,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__ConfiguredSKU__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__ProductOption__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     constraints_raw = query_table(
@@ -315,6 +337,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__ConfiguredSKU__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__OptionConstraint__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     config_attrs_raw = query_table(
@@ -322,6 +345,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         raw_path=raw_file("SBQQ__ConfigurationAttribute__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
 
@@ -330,12 +354,14 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         sf, "SBQQ__ConfigurationRule__c",
         where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     cr_rule = query_table(
         sf, "SBQQ__ConfigurationRule__c",
         where_clause="SBQQ__ProductRule__c IN (SELECT Id FROM SBQQ__ProductRule__c WHERE SBQQ__Active__c = true)",
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     # Dedupe by Id
@@ -352,6 +378,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause=f"{PRICE_RULE_ACTIVE_FIELD} = true",
         raw_path=raw_file("SBQQ__PriceRule__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     price_rule_ids = set(r["Id"] for r in price_rules_raw)
@@ -418,6 +445,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause=f"{PRODUCT_RULE_ACTIVE_FIELD} = true",
         raw_path=raw_file("SBQQ__ProductRule__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     product_rule_ids = set(r["Id"] for r in product_rules_raw)
@@ -427,6 +455,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Rule__c IN (SELECT Id FROM SBQQ__ProductRule__c WHERE SBQQ__Active__c = true)",
         raw_path=raw_file("SBQQ__ErrorCondition__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     product_actions_raw = query_table(
@@ -434,6 +463,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Rule__c IN (SELECT Id FROM SBQQ__ProductRule__c WHERE SBQQ__Active__c = true)",
         raw_path=raw_file("SBQQ__ProductAction__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
 
@@ -442,12 +472,14 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         sf, "SBQQ__LookupQuery__c",
         where_clause="SBQQ__ProductRule__c IN (SELECT Id FROM SBQQ__ProductRule__c WHERE SBQQ__Active__c = true)",
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     lq_prc = query_table(
         sf, "SBQQ__LookupQuery__c",
         where_clause="SBQQ__PriceRule2__c IN (SELECT Id FROM SBQQ__PriceRule__c WHERE SBQQ__Active__c = true)",
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     lookup_queries_merged = {lq["Id"]: lq for lq in lq_pr}
@@ -480,6 +512,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Rule__c IN (SELECT Id FROM SBQQ__PriceRule__c WHERE SBQQ__Active__c = true)",
         raw_path=raw_file("SBQQ__PriceCondition__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
     price_actions_raw = query_table(
@@ -487,6 +520,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         where_clause="SBQQ__Rule__c IN (SELECT Id FROM SBQQ__PriceRule__c WHERE SBQQ__Active__c = true)",
         raw_path=raw_file("SBQQ__PriceAction__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
 
@@ -510,6 +544,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         sf, "SBQQ__SummaryVariable__c",
         raw_path=raw_file("SBQQ__SummaryVariable__c"),
         use_bulk=use_bulk,
+        force_fresh=force_fresh,
         extract_log=extract_log,
     )
 

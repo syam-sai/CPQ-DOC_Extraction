@@ -75,19 +75,24 @@ def synthesize_all(facts: dict, analyses_dict: dict, run_dir: str,
     step("Synthesizing executive summary and section narratives...")
 
     # Group analyses by type
-    rule_analyses = []
+    product_rule_analyses = []
+    price_rule_analyses = []
     bundle_analyses = []
     standalone_analyses = []
 
     for item in analyses_dict.values():
         ptype = item.get("packet_type")
         analysis = item.get("analysis", {})
-        if ptype in ("product_rule", "price_rule"):
-            rule_analyses.append(analysis)
+        if ptype == "product_rule":
+            product_rule_analyses.append(analysis)
+        elif ptype == "price_rule":
+            price_rule_analyses.append(analysis)
         elif ptype == "bundle":
             bundle_analyses.append(analysis)
         elif ptype == "standalone_summary":
             standalone_analyses.append(analysis)
+
+    rule_analyses = product_rule_analyses + price_rule_analyses
 
     # 1. Synthesize Executive Summary
     step("Synthesizing Executive Summary...")
@@ -167,7 +172,7 @@ Return JSON: {{"paragraphs": ["..."]}}"""
 
     # 3. Synthesize Business Rules Section Narrative
     step("Synthesizing Rules narrative...")
-    rules_user_prompt = f"""Write an introduction to the Business Rules section (2 paragraphs).
+    rules_user_prompt = f"""Write an introduction to the Product Rules and Price Rules section (2 paragraphs).
 Explain how validation, auto-addition, and alert rules safeguard quote quality.
 Placeholders available: {{{{product_rules_total}}}}, {{{{validation_rules_count}}}}, {{{{selection_rules_count}}}}, {{{{alert_rules_count}}}}, {{{{price_rules_total}}}}.
 Rule types present: {json.dumps(facts.get('product_rules', {}).get('by_type', {}))}
@@ -182,14 +187,14 @@ Return JSON: {{"paragraphs": ["..."]}}"""
     except Exception:
         rule_paragraphs = [
             substitute_placeholders(
-                "Business rules automate quotation governance, ensuring quotes conform to technical prerequisites "
+                "Product rules and price rules automate quotation governance, ensuring quotes conform to technical prerequisites "
                 "and corporate sales policies without requiring manual engineering oversight.",
                 placeholder_map
             ),
             substitute_placeholders(
-                "Your setup contains {{product_rules_total}} product rules and {{price_rules_total}} price rule. "
-                "These rules automatically validate selections, add mandatory prerequisites (such as analytics modules), "
-                "and alert sales representatives to recommended service tiers.",
+                "Your setup contains {{product_rules_total}} product rules and {{price_rules_total}} price rules. "
+                "Product rules automatically validate selections and add mandatory prerequisites, while price rules dynamically "
+                "calculate list prices and enforce approved package discounting.",
                 placeholder_map
             )
         ]
@@ -229,6 +234,8 @@ Return JSON: {{"paragraphs": ["..."]}}"""
         "rules_introduction": rule_paragraphs,
         "pricing_introduction": pricing_paragraphs,
         "bundle_analyses": bundle_analyses,
+        "product_rule_analyses": product_rule_analyses,
+        "price_rule_analyses": price_rule_analyses,
         "rule_analyses": rule_analyses,
         "standalone_analyses": standalone_analyses,
         "observations": facts.get("observations", []),
