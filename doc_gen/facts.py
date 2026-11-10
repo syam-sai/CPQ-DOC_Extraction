@@ -8,6 +8,16 @@ import json
 from collections import Counter
 
 
+def is_active_product(product):
+    """Treats legacy extracts without IsActive as active, while parsing CSV strings."""
+    value = product.get("IsActive")
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"false", "0", "no"}
+
+
 def load_extraction_data(data_or_run_dir):
     """Loads extraction data from a dict, a file path, or a run directory."""
     if isinstance(data_or_run_dir, dict):
@@ -43,19 +53,30 @@ def compute_facts(data_or_run_dir):
     """
     data = load_extraction_data(data_or_run_dir)
 
-    products = data.get("Product", [])
+    all_products = data.get("Product", [])
+    products = [product for product in all_products if is_active_product(product)]
     product_rules = data.get("ProductRules", [])
     price_rules = data.get("PriceRules", [])
     summary_variables = data.get("SummaryVariables", [])
+    metadata = data.get("metadata", {})
+    inactive_products_included_count = sum(
+        not is_active_product(product) for product in all_products
+    )
+    inactive_products_count = metadata.get("inactive_products_count")
+    if metadata.get("include_inactive_records"):
+        inactive_products_count = inactive_products_included_count
 
     active_product_ids = {p.get("Id") for p in products if p.get("Id")}
-    product_name_by_id = {p.get("Id"): (p.get("Name") or p.get("ProductCode") or p.get("Id")) for p in products if p.get("Id")}
+    product_name_by_id = {
+        p.get("Id"): (p.get("Name") or p.get("ProductCode") or p.get("Id"))
+        for p in products if p.get("Id")
+    }
 
     # 1. Product & Bundle Classification
     bundles = []
-    standalone_products = []
     bundles_with_features = []
     bundles_direct_only = []
+    option_product_ids = set()
 
     features_all = []
     options_all = []
@@ -101,6 +122,16 @@ def compute_facts(data_or_run_dir):
         options_all.extend(direct_opts)
         for feat in p_features:
             options_all.extend(feat.get("options", []))
+            option_product_ids.update(
+                option.get("SBQQ__OptionalSKU__c")
+                for option in feat.get("options", [])
+                if option.get("SBQQ__OptionalSKU__c")
+            )
+        option_product_ids.update(
+            option.get("SBQQ__OptionalSKU__c")
+            for option in direct_opts
+            if option.get("SBQQ__OptionalSKU__c")
+        )
 
         total_opts_count = sum(len(f.get("options", [])) for f in p_features) + len(direct_opts)
 
@@ -110,8 +141,16 @@ def compute_facts(data_or_run_dir):
                 bundles_with_features.append(p)
             else:
                 bundles_direct_only.append(p)
-        else:
-            standalone_products.append(p)
+
+    bundle_ids = {p.get("Id") for p in bundles if p.get("Id")}
+    standalone_products = [
+        p for p in products
+        if p.get("Id") not in bundle_ids and p.get("Id") not in option_product_ids
+    ]
+    option_products_sold_alone = [
+        p for p in products
+        if p.get("Id") in option_product_ids and p.get("Id") not in bundle_ids
+    ]
 
     # 2. Product Rules Classification
     pr_by_type = Counter()
@@ -244,9 +283,29 @@ def compute_facts(data_or_run_dir):
 
     # 5. Compile Facts Dictionary
     facts = {
+        "metadata": metadata,
         "active_products": len(products),
+        "total_products_extracted": len(all_products),
+        "inactive_products_count": inactive_products_count,
+        "inactive_products_included": inactive_products_included_count,
+        "inactive_products_excluded_count": (
+            inactive_products_count
+            if not metadata.get("include_inactive_records")
+            else 0
+        ),
         "total_bundles": len(bundles),
         "standalone_products": len(standalone_products),
+        "distinct_option_products": len(option_product_ids),
+        "option_products_also_sold_alone": len(option_products_sold_alone),
+        "option_products_also_sold_alone_names": [
+            p.get("Name") or p.get("ProductCode")
+            for p in option_products_sold_alone
+        ],
+        "feature_categories_by_bundle": {
+            p.get("ProductCode") or p.get("Name") or p.get("Id"):
+                len(p.get("features", []))
+            for p in bundles
+        },
         "total_features": len(features_all),
         "total_options": len(options_all),
         "total_pricebooks": max(len(pricebooks_set), 1 if pricebook_entries_all else 0),
@@ -283,4 +342,3 @@ def compute_facts(data_or_run_dir):
     }
 
     return facts
-

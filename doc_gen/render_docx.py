@@ -27,6 +27,15 @@ HEX_BORDER = "D1D5DB"
 HEX_ALERT_BG = "FFF4F4"
 
 
+def _rule_order_key(rule):
+    value = rule.get("evaluation_order")
+    try:
+        order = float(value)
+    except (TypeError, ValueError):
+        order = float("inf")
+    return order, rule.get("rule_name", "")
+
+
 def set_cell_margins(cell, top=100, bottom=100, left=150, right=150):
     """Sets internal padding for a table cell in twentieths of a point (dxa)."""
     tcPr = cell._tc.get_or_add_tcPr()
@@ -140,7 +149,15 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     title_p = doc.add_paragraph()
     title_p.paragraph_format.space_before = Pt(72)
     title_p.paragraph_format.space_after = Pt(8)
-    r_badge = title_p.add_run("[ DRAFT - FOR DISCUSSION PURPOSES ]\n\n")
+    has_data_errors = (
+        facts.get("data_quality_errors", 0) > 0
+        or any(
+            str(finding.get("severity", "")).upper() == "ERROR"
+            for finding in sections.get("data_quality", [])
+        )
+    )
+    badge = "[ DRAFT - DATA ISSUES ]" if has_data_errors else "[ DRAFT - FOR DISCUSSION PURPOSES ]"
+    r_badge = title_p.add_run(f"{badge}\n\n")
     r_badge.font.size = Pt(11)
     r_badge.font.bold = True
     r_badge.font.color.rgb = COLOR_ALERT
@@ -208,6 +225,8 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     intro_p.paragraph_format.space_after = Pt(8)
 
     glossary_items = [
+        ("CPQ", "Configure, Price, Quote: the Salesforce product and pricing configuration system covered by this document."),
+        ("SKU", "Stock Keeping Unit: a code used to identify a product."),
         ("Product", "A commercial good or service that sales representatives can add to an estimate or contract."),
         ("Bundle", "A core package product (like a workstation or enterprise platform) that includes customizable component options."),
         ("Feature", "A category tab within a bundle (such as 'Processor', 'Storage', or 'Support Tier') that organizes component choices."),
@@ -260,10 +279,26 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     # Summary Metrics Table
     summary_metrics = [
         ("Active Products", f"{facts.get('active_products', 0):,}", "Commercial products available for sale"),
+        (
+            "Inactive Products",
+            (
+                f"{facts['inactive_products_count']:,}"
+                if isinstance(facts.get("inactive_products_count"), int)
+                else "Not available"
+            ),
+            "Included in the extract" if facts.get("metadata", {}).get("include_inactive_records")
+            else "Excluded from the extract",
+        ),
         ("Configurable Bundles", f"{facts.get('total_bundles', 0):,}", "Products structured with component selections"),
-        ("Standalone Products", f"{facts.get('standalone_products', 0):,}", "Items sold directly without sub-components"),
+        ("Standalone Products", f"{facts.get('standalone_products', 0):,}", "Products that are neither bundles nor bundle options"),
         ("Feature Categories", f"{facts.get('total_features', 0):,}", "Organizational sections across all bundles"),
         ("Selectable Component Options", f"{facts.get('total_options', 0):,}", "Total configurable choices available to reps"),
+        ("Distinct Products Used as Options", f"{facts.get('distinct_option_products', 0):,}", "Unique products referenced by option records"),
+        (
+            "Products Also Used as Options",
+            f"{facts.get('option_products_also_sold_alone', 0):,}",
+            "Active products that are options and may also be sold independently",
+        ),
         ("Active Product Rules", f"{facts.get('product_rules', {}).get('total', 0):,}", "Automated configuration validation rules"),
         ("Active Price Rules", f"{facts.get('price_rules', {}).get('total', 0):,}", "Dynamic pricing calculation rules"),
         ("Active Pricebook Entries", f"{facts.get('total_pricebook_entries', 0):,}", f"Priced items across {facts.get('total_pricebooks', 1)} pricebook(s)")
@@ -298,40 +333,59 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     doc.add_paragraph().paragraph_format.space_after = Pt(8)
 
     # Product Family Breakdown
-    doc.add_heading("Product Catalog by Family", level=2)
-    doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
-
     fam_data = facts.get("products_by_family", {})
     tot_p = facts.get("active_products", 1) or 1
+    if len(fam_data) > 1:
+        doc.add_heading("Product Catalog by Family", level=2)
+        doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
 
-    f_tbl = doc.add_table(rows=len(fam_data) + 1, cols=3)
-    f_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-    f_tbl.autofit = False
-    f_tbl.columns[0].width = Inches(2.8)
-    f_tbl.columns[1].width = Inches(1.4)
-    f_tbl.columns[2].width = Inches(2.3)
-    set_table_borders(f_tbl)
+        f_tbl = doc.add_table(rows=len(fam_data) + 1, cols=3)
+        f_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        f_tbl.autofit = False
+        f_tbl.columns[0].width = Inches(2.8)
+        f_tbl.columns[1].width = Inches(1.4)
+        f_tbl.columns[2].width = Inches(2.3)
+        set_table_borders(f_tbl)
 
-    for c, h in zip(f_tbl.rows[0].cells, ["Product Family", "Number of Products", "Catalog Share"]):
-        set_cell_background(c, HEX_LIGHT_BG)
-        set_cell_margins(c, 100, 100, 150, 150)
-        r = c.paragraphs[0].add_run(h)
-        r.bold = True
-        r.font.color.rgb = COLOR_PRIMARY
+        for c, h in zip(f_tbl.rows[0].cells, ["Product Family", "Number of Products", "Catalog Share"]):
+            set_cell_background(c, HEX_LIGHT_BG)
+            set_cell_margins(c, 100, 100, 150, 150)
+            r = c.paragraphs[0].add_run(h)
+            r.bold = True
+            r.font.color.rgb = COLOR_PRIMARY
 
-    for idx, (fam, count) in enumerate(fam_data.items(), start=1):
-        row = f_tbl.rows[idx]
-        set_cell_margins(row.cells[0], 80, 80, 150, 150)
-        set_cell_margins(row.cells[1], 80, 80, 150, 150)
-        set_cell_margins(row.cells[2], 80, 80, 150, 150)
-        row.cells[0].paragraphs[0].add_run(fam).bold = True
-        p1 = row.cells[1].paragraphs[0]
-        p1.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p1.add_run(f"{count:,}")
-        pct = (count / tot_p) * 100
-        row.cells[2].paragraphs[0].add_run(f"{pct:.1f}%")
+        for idx, (fam, count) in enumerate(fam_data.items(), start=1):
+            row = f_tbl.rows[idx]
+            set_cell_margins(row.cells[0], 80, 80, 150, 150)
+            set_cell_margins(row.cells[1], 80, 80, 150, 150)
+            set_cell_margins(row.cells[2], 80, 80, 150, 150)
+            row.cells[0].paragraphs[0].add_run(fam).bold = True
+            p1 = row.cells[1].paragraphs[0]
+            p1.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p1.add_run(f"{count:,}")
+            pct = (count / tot_p) * 100
+            row.cells[2].paragraphs[0].add_run(f"{pct:.1f}%")
 
     doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+    changes = sections.get("changes")
+    if changes:
+        doc.add_heading("What Changed Since Previous Extract", level=2)
+        for category in ("products", "rules", "prices"):
+            details = changes.get(category, {})
+            counts = changes.get("totals", {}).get(category, {})
+            doc.add_paragraph(
+                f"{category.capitalize()}: {counts.get('added', 0)} added, "
+                f"{counts.get('removed', 0)} removed, "
+                f"{counts.get('modified', 0)} modified."
+            )
+            for action in ("added", "removed", "modified"):
+                labels = details.get(action, [])
+                if labels:
+                    doc.add_paragraph(
+                        f"{action.capitalize()}: {', '.join(labels)}",
+                        style="List Bullet",
+                    )
 
     # -------------------------------------------------------------
     # SECTION 4: HOW PRODUCTS ARE BUNDLED AND CONFIGURED
@@ -346,57 +400,154 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     doc.add_heading("Configurable Product Packages", level=2)
     doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
 
+    bundle_details_by_name = {
+        packet.get("bundle_name"): packet
+        for packet in sections.get("bundle_details", [])
+        if packet.get("bundle_name")
+    }
     for b in sections.get("bundle_analyses", []):
         b_name = b.get("name", "Product Bundle")
+        bundle_detail = bundle_details_by_name.get(b_name)
         doc.add_heading(b_name, level=3)
         doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
 
         doc.add_paragraph(b.get("one_line_summary", "")).paragraph_format.space_after = Pt(4)
         doc.add_paragraph(f"Commercial Packaging: {b.get('how_it_is_sold', '')}").paragraph_format.space_after = Pt(4)
 
-        choices = b.get("choices_offered", [])
-        if choices:
-            b_tbl = doc.add_table(rows=len(choices) + 1, cols=3)
-            b_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-            b_tbl.autofit = False
-            b_tbl.columns[0].width = Inches(1.8)
-            b_tbl.columns[1].width = Inches(2.2)
-            b_tbl.columns[2].width = Inches(2.5)
-            set_table_borders(b_tbl)
+        if bundle_detail:
+            feature_count = len(bundle_detail.get("features", []))
+            option_count = sum(
+                len(feature.get("options", []))
+                for feature in bundle_detail.get("features", [])
+            ) + len(bundle_detail.get("ungrouped_options", []))
+            doc.add_paragraph(
+                f"Feature categories in this bundle: {feature_count}; option records: {option_count}."
+            )
+            option_rows = []
+            for feature in bundle_detail.get("features", []):
+                feature_name = feature.get("feature_name") or "Not available in extracted data"
+                for option in feature.get("options", []):
+                    option_rows.append((feature_name, option))
+            for option in bundle_detail.get("ungrouped_options", []):
+                option_rows.append(("Direct option", option))
 
-            for c, h in zip(b_tbl.rows[0].cells, ["Feature Section", "Customer Decision", "Available Options"]):
-                set_cell_background(c, HEX_LIGHT_BG)
-                set_cell_margins(c, 80, 80, 120, 120)
-                r = c.paragraphs[0].add_run(h)
-                r.bold = True
-                r.font.size = Pt(9.5)
-                r.font.color.rgb = COLOR_PRIMARY
+            if option_rows:
+                b_tbl = doc.add_table(rows=len(option_rows) + 1, cols=3)
+                b_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+                b_tbl.autofit = False
+                b_tbl.columns[0].width = Inches(1.7)
+                b_tbl.columns[1].width = Inches(2.6)
+                b_tbl.columns[2].width = Inches(2.2)
+                set_table_borders(b_tbl)
+                for cell, heading in zip(
+                    b_tbl.rows[0].cells,
+                    ["Feature", "Option (CODE - Name)", "Required / Default / Quantity"],
+                ):
+                    set_cell_background(cell, HEX_LIGHT_BG)
+                    set_cell_margins(cell, 80, 80, 120, 120)
+                    cell.paragraphs[0].add_run(heading).bold = True
+                for row_index, (feature_name, option) in enumerate(option_rows, start=1):
+                    component_name = option.get("component_name") or "Not available in extracted data"
+                    code = option.get("component_sku")
+                    label = (
+                        f"{code} - {component_name}"
+                        if code and code != "No SKU" and not component_name.startswith(f"{code} - ")
+                        else component_name
+                    )
+                    quantity = option.get("default_quantity", "Not available in extracted data")
+                    bounds = []
+                    if option.get("min_quantity") is not None:
+                        bounds.append(f"min {option['min_quantity']}")
+                    if option.get("max_quantity") is not None:
+                        bounds.append(f"max {option['max_quantity']}")
+                    quantity_text = f"default {quantity}"
+                    if bounds:
+                        quantity_text += f" ({', '.join(bounds)})"
+                    quantity_text += (
+                        "; editable" if option.get("quantity_editable") else "; fixed"
+                    )
+                    required_text = "Required" if option.get("required") else "Optional"
+                    selected_text = (
+                        "selected by default"
+                        if option.get("selected_by_default")
+                        else "not selected by default"
+                    )
+                    shared_count = option.get("shared_by_bundle_count", 0)
+                    if shared_count > 1:
+                        selected_text += f"; shared by {shared_count} bundles"
+                    row = b_tbl.rows[row_index]
+                    for cell in row.cells:
+                        set_cell_margins(cell, 60, 60, 120, 120)
+                    row.cells[0].text = feature_name
+                    row.cells[1].text = label
+                    row.cells[2].text = f"{required_text}; {selected_text}; {quantity_text}"
 
-            for c_idx, c_info in enumerate(choices, start=1):
-                row = b_tbl.rows[c_idx]
-                set_cell_margins(row.cells[0], 60, 60, 120, 120)
-                set_cell_margins(row.cells[1], 60, 60, 120, 120)
-                set_cell_margins(row.cells[2], 60, 60, 120, 120)
+            attributes = bundle_detail.get("configuration_attributes", [])
+            if attributes:
+                doc.add_paragraph("Configuration Attributes").runs[0].bold = True
+                for attribute in attributes:
+                    attr_name = attribute.get("attribute_name") or "Unnamed attribute"
+                    field_name = attribute.get("target_field") or "Not available in extracted data"
+                    data_type = attribute.get("data_type") or "type not available"
+                    values = attribute.get("picklist_values") or attribute.get("shown_values")
+                    value_text = (
+                        ", ".join(str(value) for value in values)
+                        if isinstance(values, list) else values
+                    )
+                    text = f"{attr_name}: {field_name} ({data_type})"
+                    if value_text:
+                        text += f"; values: {value_text}"
+                    doc.add_paragraph(text, style="List Bullet")
 
-                p0 = row.cells[0].paragraphs[0]
-                p0.add_run(c_info.get("feature", "Category")).bold = True
-                p0.runs[0].font.size = Pt(9)
+            if bundle_detail.get("affecting_rules"):
+                doc.add_paragraph(
+                    "Rules affecting this bundle: "
+                    + ", ".join(bundle_detail["affecting_rules"])
+                )
+        else:
+            choices = b.get("choices_offered", [])
+            if choices:
+                b_tbl = doc.add_table(rows=len(choices) + 1, cols=3)
+                b_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+                b_tbl.autofit = False
+                b_tbl.columns[0].width = Inches(1.8)
+                b_tbl.columns[1].width = Inches(2.2)
+                b_tbl.columns[2].width = Inches(2.5)
+                set_table_borders(b_tbl)
 
-                p1 = row.cells[1].paragraphs[0]
-                p1.add_run(c_info.get("what_customer_chooses", ""))
-                p1.runs[0].font.size = Pt(9)
+                for c, h in zip(b_tbl.rows[0].cells, ["Feature Section", "Customer Decision", "Available Options"]):
+                    set_cell_background(c, HEX_LIGHT_BG)
+                    set_cell_margins(c, 80, 80, 120, 120)
+                    r = c.paragraphs[0].add_run(h)
+                    r.bold = True
+                    r.font.size = Pt(9.5)
+                    r.font.color.rgb = COLOR_PRIMARY
 
-                p2 = row.cells[2].paragraphs[0]
-                opts = c_info.get("option_names", [])
-                p2.add_run(", ".join(opts) if opts else "Standard options")
-                p2.runs[0].font.size = Pt(9)
+                for c_idx, c_info in enumerate(choices, start=1):
+                    row = b_tbl.rows[c_idx]
+                    set_cell_margins(row.cells[0], 60, 60, 120, 120)
+                    set_cell_margins(row.cells[1], 60, 60, 120, 120)
+                    set_cell_margins(row.cells[2], 60, 60, 120, 120)
 
-            doc.add_paragraph().paragraph_format.space_after = Pt(4)
+                    p0 = row.cells[0].paragraphs[0]
+                    p0.add_run(c_info.get("feature", "Category")).bold = True
+                    p0.runs[0].font.size = Pt(9)
 
-        if b.get("ungrouped_options"):
+                    p1 = row.cells[1].paragraphs[0]
+                    p1.add_run(c_info.get("what_customer_chooses", ""))
+                    p1.runs[0].font.size = Pt(9)
+
+                    p2 = row.cells[2].paragraphs[0]
+                    opts = c_info.get("option_names", [])
+                    p2.add_run(", ".join(opts) if opts else "Standard options")
+                    p2.runs[0].font.size = Pt(9)
+
+                doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+        if not bundle_detail and b.get("ungrouped_options"):
             doc.add_paragraph(f"Direct Add-on Options: {', '.join(b['ungrouped_options'])}").paragraph_format.space_after = Pt(4)
 
-        if b.get("rules_that_affect_it"):
+        if not bundle_detail and b.get("rules_that_affect_it"):
             doc.add_paragraph(f"Automated Rules Affecting This Bundle: {', '.join(b['rules_that_affect_it'])}").paragraph_format.space_after = Pt(4)
 
         doc.add_paragraph().paragraph_format.space_after = Pt(6)
@@ -410,69 +561,81 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     for p_text in sections.get("rules_introduction", []):
         doc.add_paragraph(p_text).paragraph_format.space_after = Pt(6)
 
-    prod_rules = sections.get("product_rule_analyses")
-    if not prod_rules:
-        prod_rules = [r for r in sections.get("rule_analyses", []) if r.get("kind") != "price"]
+    product_rule_analyses = {
+        rule.get("name"): rule
+        for rule in sections.get("product_rule_analyses", [])
+        if rule.get("name")
+    }
+    product_rule_details = sections.get("rule_details", {}).get("product_rules", [])
 
-    price_rules = sections.get("price_rule_analyses")
-    if not price_rules:
-        price_rules = [r for r in sections.get("rule_analyses", []) if r.get("kind") == "price"]
-
-    # --- Part A: Product Rules ---
     doc.add_heading("Product Rules", level=2)
     doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
-    doc.add_paragraph(
-        "Product rules safeguard configuration integrity by validating sales selections, "
-        "preventing incompatible combinations, and automatically adding or removing required components:"
-    ).paragraph_format.space_after = Pt(6)
+    if not product_rule_details:
+        product_rule_details = [
+            {"rule_name": rule.get("name", "Product Rule")}
+            for rule in sections.get("product_rule_analyses", [])
+        ]
 
-    for r in prod_rules:
-        r_name = r.get("name", "Product Rule")
-        r_kind = (r.get("kind") or "Validation").capitalize()
+    product_rule_details = sorted(
+        product_rule_details,
+        key=_rule_order_key,
+    )
+    for detail in product_rule_details:
+        r_name = detail.get("rule_name", "Product Rule")
+        r_kind = str(detail.get("rule_type") or "Rule").capitalize()
         doc.add_heading(f"{r_name} ({r_kind})", level=3)
         doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
 
-        doc.add_paragraph(f"Overview: {r.get('one_line_summary', '')}").paragraph_format.space_after = Pt(3)
-        doc.add_paragraph(f"When it triggers: {r.get('when_it_applies', '')}").paragraph_format.space_after = Pt(3)
-        doc.add_paragraph(f"System behavior: {r.get('what_it_does', '')}").paragraph_format.space_after = Pt(3)
-
-        msg = r.get("message_shown_to_user")
-        if msg:
-            add_callout(doc, f'"{msg}"', title="Notification Displayed to Sales Representative:")
-
-        if r.get("inferred_purpose"):
-            doc.add_paragraph(f"Business Intent: {r['inferred_purpose']}").paragraph_format.space_after = Pt(3)
-
-        if r.get("related_items"):
-            doc.add_paragraph(f"Related Catalog Items: {', '.join(r['related_items'])}").paragraph_format.space_after = Pt(3)
-
-        doc.add_paragraph().paragraph_format.space_after = Pt(8)
-
-    # --- Part B: Price Rules ---
-    if price_rules:
-        doc.add_heading("Price Rules", level=2)
-        doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
+        metadata = (
+            f"Active: {detail.get('active', 'Not available')}; "
+            f"scope: {detail.get('scope', 'Not available')}; "
+            f"evaluation event: {detail.get('evaluation_event', 'Not available')}; "
+            f"evaluation order: {detail.get('evaluation_order', 'Not available')}; "
+            f"conditions met: {detail.get('conditions_met', 'Not available')}."
+        )
+        if detail.get("custom_condition_expression"):
+            metadata += f" Custom expression: {detail['custom_condition_expression']}."
+        doc.add_paragraph(metadata).paragraph_format.space_after = Pt(3)
+        condition_types = sorted({
+            str(condition.get("error_condition_type"))
+            for condition in detail.get("conditions", [])
+            if condition.get("error_condition_type")
+        })
         doc.add_paragraph(
-            "Price rules automate quotation math by dynamically calculating list prices "
-            "and applying approved package discounts during quote calculation cycles:"
-        ).paragraph_format.space_after = Pt(6)
+            "Error condition type: "
+            + (", ".join(condition_types) if condition_types else "Not available in extracted data")
+        ).paragraph_format.space_after = Pt(3)
 
-        for pr in price_rules:
-            pr_name = pr.get("name", "Price Rule")
-            doc.add_heading(f"{pr_name}", level=3)
-            doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
+        conditions = detail.get("conditions", [])
+        trigger_parts = [
+            f"{condition.get('tested_target') or 'Not available in extracted data'} "
+            f"{condition.get('comparison_operator') or 'equals'} "
+            f"{condition.get('target_value') if condition.get('target_value') is not None else 'VALUE NOT RESOLVED'}"
+            for condition in conditions
+        ]
+        trigger = " and ".join(trigger_parts) if trigger_parts else "No condition was extracted."
+        doc.add_paragraph(f"Trigger: {trigger}").paragraph_format.space_after = Pt(3)
 
-            doc.add_paragraph(f"Commercial Impact: {pr.get('one_line_summary', '')}").paragraph_format.space_after = Pt(3)
-            doc.add_paragraph(f"Calculation Trigger: {pr.get('when_it_applies', '')}").paragraph_format.space_after = Pt(3)
-            doc.add_paragraph(f"Pricing Formula & Behavior: {pr.get('what_it_does', '')}").paragraph_format.space_after = Pt(3)
+        actions = detail.get("actions", [])
+        if actions:
+            doc.add_paragraph("Effects:").runs[0].bold = True
+            for action in actions:
+                description = action.get("action_description") or "Effect not available in extracted data"
+                doc.add_paragraph(description, style="List Bullet")
+        else:
+            doc.add_paragraph("Effects: Not available in extracted data.")
 
-            if pr.get("inferred_purpose"):
-                doc.add_paragraph(f"Business Intent: {pr['inferred_purpose']}").paragraph_format.space_after = Pt(3)
+        message = detail.get("error_message_shown_to_user")
+        if message:
+            add_callout(doc, f'"{message}"', title="Message shown to the sales rep:")
+        if conditions:
+            example = f"Example: If {trigger}, the rule evaluates and applies the listed effect(s)."
+        else:
+            example = "Example: Not available in extracted data because no trigger condition was extracted."
+        doc.add_paragraph(example).paragraph_format.space_after = Pt(3)
 
-            if pr.get("related_items"):
-                doc.add_paragraph(f"Catalog Products Affected: {', '.join(pr['related_items'])}").paragraph_format.space_after = Pt(3)
-
-            doc.add_paragraph().paragraph_format.space_after = Pt(8)
+        for finding in detail.get("data_quality", []):
+            doc.add_paragraph(f"Data quality: {finding}", style="List Bullet")
 
     # -------------------------------------------------------------
     # SECTION 6: HOW PRICING WORKS
@@ -483,10 +646,35 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     for p_text in sections.get("pricing_introduction", []):
         doc.add_paragraph(p_text).paragraph_format.space_after = Pt(6)
 
+    product_prices = sections.get("product_prices", [])
+    if product_prices:
+        doc.add_heading("Extracted Product Prices", level=2)
+        price_table = doc.add_table(rows=len(product_prices) + 1, cols=3)
+        price_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        price_table.autofit = False
+        price_table.columns[0].width = Inches(3.5)
+        price_table.columns[1].width = Inches(1.3)
+        price_table.columns[2].width = Inches(1.6)
+        set_table_borders(price_table)
+        for cell, label in zip(
+            price_table.rows[0].cells, ["Product (CODE - Name)", "Currency", "Unit Price"]
+        ):
+            set_cell_background(cell, HEX_LIGHT_BG)
+            cell.paragraphs[0].add_run(label).bold = True
+        for row_idx, entry in enumerate(product_prices, start=1):
+            price_table.cell(row_idx, 0).text = entry.get("product") or "Unnamed product"
+            price_table.cell(row_idx, 1).text = entry.get("currency") or "Currency not available"
+            amount = entry.get("unit_price")
+            price_table.cell(row_idx, 2).text = (
+                "Not available in extracted data" if amount is None else str(amount)
+            )
+    else:
+        doc.add_paragraph("Product prices: Not available in extracted data.")
+
     pricing_models = [
-        ("Standard List Pricing", f"{facts.get('total_pricebook_entries', 0):,} items priced via standard catalog price books."),
-        ("Tiered Block Pricing", f"{facts.get('total_block_prices', 0):,} products configured with quantity bracket tiers (e.g. hourly packages or user volume brackets)."),
-        ("Recurring Service Dimensions", f"{facts.get('total_dimensions', 0):,} services configured with multi-year recurring billing schedules.")
+        ("Standard List Pricing", f"{facts.get('total_pricebook_entries', 0):,} pricebook entries were extracted."),
+        ("Block Pricing", f"{facts.get('total_block_prices', 0):,} block-price records were extracted."),
+        ("Pricing Dimensions", f"{facts.get('total_dimensions', 0):,} pricing-dimension records were extracted.")
     ]
 
     p_tbl = doc.add_table(rows=len(pricing_models) + 1, cols=2)
@@ -511,32 +699,108 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     doc.add_paragraph().paragraph_format.space_after = Pt(10)
 
     # Detailed Automated Dynamic Pricing Rules
-    price_rules = sections.get("price_rule_analyses", [])
-    if not price_rules:
-        price_rules = [r for r in sections.get("rule_analyses", []) if r.get("kind") == "price"]
+    price_rule_analyses = {
+        rule.get("name"): rule
+        for rule in sections.get("price_rule_analyses", [])
+        if rule.get("name")
+    }
+    price_rule_details = sections.get("rule_details", {}).get("price_rules", [])
 
-    if price_rules:
+    if price_rule_details or price_rule_analyses:
         doc.add_heading("Automated Dynamic Pricing Rules", level=2)
         doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_SECONDARY
         doc.add_paragraph(
-            "In addition to standard price book rates, your catalog enforces dynamic pricing through automated price rules. "
-            "These rules eliminate manual calculation errors by evaluating quote lines in real time during the quotation cycle:"
+            "The following details are taken from the extracted price-rule conditions, actions, and lookup-query definitions."
         ).paragraph_format.space_after = Pt(6)
 
-        for pr in price_rules:
-            pr_name = pr.get("name", "Pricing Rule")
+        if not price_rule_details:
+            price_rule_details = [
+                {"rule_name": rule.get("name", "Pricing Rule")}
+                for rule in price_rule_analyses.values()
+            ]
+        price_rule_details = sorted(
+            price_rule_details,
+            key=_rule_order_key,
+        )
+        for detail in price_rule_details:
+            pr_name = detail.get("rule_name", "Pricing Rule")
             doc.add_heading(f"{pr_name}", level=3)
             doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
 
-            doc.add_paragraph(f"Commercial Impact: {pr.get('one_line_summary', '')}").paragraph_format.space_after = Pt(3)
-            doc.add_paragraph(f"Calculation Trigger: {pr.get('when_it_applies', '')}").paragraph_format.space_after = Pt(3)
-            doc.add_paragraph(f"Pricing Behavior & Formula: {pr.get('what_it_does', '')}").paragraph_format.space_after = Pt(3)
+            doc.add_paragraph(
+                f"Active: {detail.get('active', 'Not available')}; "
+                f"scope: {detail.get('scope', 'Not available')}; "
+                f"evaluation event: {detail.get('evaluation_event', 'Not available')}; "
+                f"evaluation order: {detail.get('evaluation_order', 'Not available')}; "
+                f"conditions met: {detail.get('conditions_met', 'Not available')}."
+            ).paragraph_format.space_after = Pt(3)
+            if detail.get("custom_condition_expression"):
+                doc.add_paragraph(
+                    f"Custom condition expression: {detail['custom_condition_expression']}"
+                ).paragraph_format.space_after = Pt(3)
+            if detail.get("scoped_to_product"):
+                doc.add_paragraph(
+                    f"Product scope: {detail['scoped_to_product']}"
+                ).paragraph_format.space_after = Pt(3)
+            if detail.get("affects_bundles"):
+                doc.add_paragraph(
+                    f"Bundles containing scoped products: {', '.join(detail['affects_bundles'])}"
+                ).paragraph_format.space_after = Pt(3)
 
-            if pr.get("inferred_purpose"):
-                doc.add_paragraph(f"Business Intent: {pr['inferred_purpose']}").paragraph_format.space_after = Pt(3)
+            conditions = detail.get("conditions", [])
+            doc.add_paragraph("Conditions:").runs[0].bold = True
+            if conditions:
+                for condition in conditions:
+                    doc.add_paragraph(
+                        f"{condition.get('field') or 'Not available in extracted data'} "
+                        f"{condition.get('operator') or 'equals'} "
+                        f"{condition.get('value') if condition.get('value') is not None else 'VALUE NOT RESOLVED'}",
+                        style="List Bullet",
+                    )
+            else:
+                doc.add_paragraph("Not available in extracted data.", style="List Bullet")
 
-            if pr.get("related_items"):
-                doc.add_paragraph(f"Catalog Products Affected: {', '.join(pr['related_items'])}").paragraph_format.space_after = Pt(3)
+            actions = detail.get("actions", [])
+            doc.add_paragraph("Price actions:").runs[0].bold = True
+            if actions:
+                for action in actions:
+                    pieces = [
+                        f"Target: {action.get('target_object') or 'Not available'} / "
+                        f"{action.get('target_field') or 'Not available'}"
+                    ]
+                    pieces.append(
+                        "Value: "
+                        + (
+                            str(action["value"])
+                            if action.get("value") is not None
+                            else "Not available in extracted data"
+                        )
+                    )
+                    if action.get("formula"):
+                        pieces.append(f"Formula: {action['formula']}")
+                    if action.get("source_variable"):
+                        pieces.append(f"Source: {action['source_variable']}")
+                    if action.get("lookup_field"):
+                        pieces.append(f"Lookup field: {action['lookup_field']}")
+                    doc.add_paragraph("; ".join(pieces), style="List Bullet")
+            else:
+                doc.add_paragraph("Not available in extracted data.", style="List Bullet")
+
+            for lookup in detail.get("lookup_queries", []):
+                summary = "; ".join(
+                    f"{key.replace('SBQQ__', '').replace('__c', '').replace('_', ' ')}: {value}"
+                    for key, value in lookup.items()
+                )
+                doc.add_paragraph(f"Lookup query: {summary}", style="List Bullet")
+            if any(
+                "lookup table rows are not available" in message.lower()
+                for message in detail.get("data_quality", [])
+            ):
+                doc.add_paragraph("Lookup table rows: Not available in extracted data.")
+            if not conditions and not actions and not detail.get("lookup_queries"):
+                doc.add_paragraph("Formula, values, tiers, and lookup data: Not available in extracted data.")
+            for finding in detail.get("data_quality", []):
+                doc.add_paragraph(f"Data quality: {finding}", style="List Bullet")
 
             doc.add_paragraph().paragraph_format.space_after = Pt(8)
 
@@ -553,21 +817,36 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
         "These represent setup anomalies or optimization opportunities that should be confirmed with your commercial team:"
     ).paragraph_format.space_after = Pt(6)
 
+    quality_findings = sections.get("data_quality", [])
     observations = sections.get("observations", [])
-    if not observations:
-        doc.add_paragraph("No significant configuration anomalies or data gaps were detected in this extraction.").paragraph_format.space_after = Pt(6)
-    else:
-        for obs in observations:
-            title = f"{obs.get('category')}: {obs.get('id')}"
-            desc = obs.get("description", "")
-            names = obs.get("affected_names", [])
-            body_text = desc
-            if names:
-                body_text += f"\n\nAffected Items: {', '.join(names[:15])}"
-                if len(names) > 15:
-                    body_text += f" (and {len(names) - 15} more)"
-
-            add_callout(doc, body_text, title=title, is_alert=True)
+    if not quality_findings and not observations:
+        doc.add_paragraph(
+            "No findings were produced. Checks run: count reconciliation, contradictory rule actions, "
+            "placeholder and ID detection, product/pricebook references, bundle-rule links, rule naming, "
+            "boundary-message consistency, and subscription pricing configuration."
+        ).paragraph_format.space_after = Pt(6)
+    for finding in quality_findings:
+        severity = str(finding.get("severity") or "INFO").upper()
+        title = f"{severity}: {finding.get('entity') or 'Data quality'}"
+        context = finding.get("rule") or finding.get("product")
+        message = finding.get("message") or "Finding details not available."
+        if context:
+            message = f"{context}: {message}"
+        add_callout(
+            doc,
+            message,
+            title=title,
+            is_alert=severity in {"ERROR", "WARNING"},
+        )
+    for observation in observations:
+        title = f"{observation.get('category')}: {observation.get('id')}"
+        body_text = observation.get("description", "")
+        names = observation.get("affected_names", [])
+        if names:
+            body_text += f"\n\nAffected Items: {', '.join(names[:15])}"
+            if len(names) > 15:
+                body_text += f" (and {len(names) - 15} more)"
+        add_callout(doc, body_text, title=title, is_alert=True)
 
     # -------------------------------------------------------------
     # SECTION 8: QUESTIONS TO CONFIRM WITH YOUR TEAM
@@ -580,14 +859,28 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
     ).paragraph_format.space_after = Pt(6)
 
     all_questions = []
-    for r in sections.get("rule_analyses", []):
-        r_type = "Price Rule" if r.get("kind") == "price" else "Product Rule"
-        for q in r.get("questions_to_confirm", []):
-            all_questions.append((f"{r_type}: {r.get('name')}", q))
+    for finding in quality_findings:
+        severity = str(finding.get("severity") or "").upper()
+        if severity not in {"ERROR", "WARNING", "INFO"}:
+            continue
+        subject = finding.get("rule") or finding.get("product") or finding.get("entity") or "This setup"
+        reason = finding.get("message") or "the extracted data contains an ambiguity"
+        all_questions.append((
+            finding.get("entity") or "Data quality",
+            (
+                f"Can your team confirm whether {subject} should be configured this way? "
+                f"This is being asked because {reason[0].lower() + reason[1:]}"
+            ),
+        ))
 
-    for b in sections.get("bundle_analyses", []):
-        for q in b.get("questions_to_confirm", []):
-            all_questions.append((f"Bundle: {b.get('name')}", q))
+    if not all_questions:
+        for rule in sections.get("rule_analyses", []):
+            rule_type = "Price Rule" if rule.get("kind") == "price" else "Product Rule"
+            for question in rule.get("questions_to_confirm", []):
+                all_questions.append((f"{rule_type}: {rule.get('name')}", question))
+        for bundle in sections.get("bundle_analyses", []):
+            for question in bundle.get("questions_to_confirm", []):
+                all_questions.append((f"Bundle: {bundle.get('name')}", question))
 
     # Deduplicate and limit to high-value questions
     seen_q = set()
@@ -598,7 +891,7 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
             unique_questions.append((topic, q))
 
     if unique_questions:
-        for idx, (topic, q) in enumerate(unique_questions[:15], start=1):
+        for idx, (topic, q) in enumerate(unique_questions[:8], start=1):
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(4)
             r_num = p.add_run(f"{idx}. [{topic}] ")
@@ -638,17 +931,53 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
         doc.add_paragraph().paragraph_format.space_after = Pt(12)
 
     # -------------------------------------------------------------
-    # SECTION 9: APPENDIX: TECHNICAL REFERENCE
+    # SCOPE AND LIMITATIONS
     # -------------------------------------------------------------
-    doc.add_heading("9. Appendix: Technical Reference", level=1)
+    doc.add_heading("9. Scope and Limitations", level=1)
+    doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
+    doc.add_paragraph(
+        "This extraction covers the CPQ catalog and records listed in the attached outputs. "
+        "It does not inspect all Salesforce automation or custom quoting behavior."
+    )
+    limitations = [
+        "Custom calculator plugin scripts (QCP) and Apex code.",
+        "Flows, approval rules, guided selling, and custom actions.",
+        "Discount schedules and contracted prices not represented in the extracted records.",
+        "Lookup-table rows and external data sources not included in the extraction.",
+    ]
+    for limitation in limitations:
+        doc.add_paragraph(limitation, style="List Bullet")
+    doc.add_paragraph(
+        "These excluded components may affect quote configuration, validation, and pricing behavior."
+    )
+
+    # -------------------------------------------------------------
+    # SECTION 10: APPENDIX: TECHNICAL REFERENCE
+    # -------------------------------------------------------------
+    doc.add_heading("10. Appendix: Technical Reference", level=1)
     doc.paragraphs[-1].runs[0].font.color.rgb = COLOR_PRIMARY
 
     doc.add_paragraph(
         "This appendix provides pointers to the underlying technical dataset and raw extraction files for Salesforce administrators and architects:"
     ).paragraph_format.space_after = Pt(6)
 
+    metadata = facts.get("metadata") or {}
+    metadata_rows = [
+        ("Organization ID", "Available in extraction metadata; not displayed here to avoid exposing record identifiers."),
+        ("Sandbox", metadata.get("is_sandbox", "Not available in extracted data")),
+        ("Instance", metadata.get("instance", "Not available in extracted data")),
+        ("Extracted at (UTC)", metadata.get("extraction_timestamp_utc", "Not available in extracted data")),
+        ("CPQ package version", metadata.get("cpq_package_version", "Not available in extracted data")),
+        ("Extractor version", metadata.get("extractor_version", "Not available in extracted data")),
+        ("JSON schema version", metadata.get("json_schema_version", "Not available in extracted data")),
+    ]
+    metadata_table = doc.add_table(rows=len(metadata_rows), cols=2)
+    set_table_borders(metadata_table)
+    for idx, (label, value) in enumerate(metadata_rows):
+        metadata_table.cell(idx, 0).text = label
+        metadata_table.cell(idx, 1).text = str(value)
     app_items = [
-        ("Excel Workbook Export", "cpq_extract.xlsx", "Comprehensive 21-tab normalized workbook containing raw records, Parent link IDs, and rollup formulas."),
+        ("Excel Workbook Export", "cpq_extract.xlsx", "Normalized workbook containing the extracted records, data-quality findings, metadata, and parent links."),
         ("Nested JSON Extract", "cpq_extract.json", "Full nested JSON schema representing the active CPQ hierarchy."),
         ("Streaming NDJSON", "cpq_extract.ndjson", "Newline-delimited JSON stream for scalable data loading and ETL pipelines."),
         ("Raw CSV Folder", "raw/", "Individual sObject CSV tables extracted directly via Salesforce Bulk API 2.0 / REST.")
@@ -676,6 +1005,7 @@ def render_document(facts: dict, sections: dict, validation_report: dict,
         row.cells[1].paragraphs[0].add_run(fn)
         row.cells[2].paragraphs[0].add_run(purp)
 
+    if metadata.get("org_id"):
+        doc.core_properties.identifier = str(metadata["org_id"])
     doc.save(output_filepath)
     return output_filepath
-

@@ -130,13 +130,10 @@ class MockLLMClient(LLMClient):
                 "what_it_does": what_it_does,
                 "message_shown_to_user": err_msg,
                 "related_items": related_items,
-                "inferred_purpose": "Appears to ensure quote configurations remain compliant with commercial packaging standards and prevent unfulfillable orders.",
+                "inferred_purpose": None,
                 "complexity": complexity,
                 "complexity_reason": f"Evaluates {cond_count} condition(s) with {len(actions)} automated action(s).",
-                "questions_to_confirm": [
-                    f"Should '{name}' apply across all quote types (new, amendment, renewal)?",
-                    f"Should sales managers have authority to override this {kind} rule under special approvals?"
-                ],
+                "questions_to_confirm": [],
                 "data_gaps": []
             }
             return json.dumps(resp, indent=2)
@@ -159,20 +156,14 @@ class MockLLMClient(LLMClient):
                 t_obj = a.get("target_object", "Quote Line")
                 act_clauses.append(f"calculates {f_name} on {t_obj}")
 
-            n_low = name.lower()
-            if "employee count" in n_low or "list price" in n_low:
-                summary = "Dynamically calculates subscription List Price scaled to customer employee headcount."
-                what_it_does = "Calculates the base List Price for training subscriptions based on the customer's employee tier (configured in bundle attributes)."
-                intent = "Appears to implement headcount-based value pricing so contract pricing scales proportionally with organization size."
-            elif "discount" in n_low:
-                tier = "Starter" if "starter" in n_low else ("Professional" if "professional" in n_low else "package")
-                summary = f"Automatically calculates and applies standard package discounts to the {tier} subscription."
-                what_it_does = f"Applies approved formula discount percentage directly to the {tier} subscription quote line across calculation events."
-                intent = "Appears to automate approved bundle discounting to protect commercial margins while streamlining quote delivery."
-            else:
-                summary = "Calculates automated pricing adjustments on quote lines during calculation."
-                what_it_does = f"Automatically {', and '.join(act_clauses)} using formula-driven pricing logic." if act_clauses else "Calculates pricing adjustments across targeted quote line items."
-                intent = "Appears to automate approved discount structures and formula-based pricing rules without requiring manual calculation by sales reps."
+            summary = (
+                f"The extracted price rule has {len(conditions)} condition(s) "
+                f"and {len(actions)} action(s)."
+            )
+            what_it_does = (
+                "; ".join(act_clauses)
+                if act_clauses else "Not available in extracted data."
+            )
 
             related_items = [str(c.get("value")) for c in conditions if c.get("field") == "Product Code" and c.get("value")]
             if user_data.get("scoped_to_product"):
@@ -186,13 +177,10 @@ class MockLLMClient(LLMClient):
                 "what_it_does": what_it_does,
                 "message_shown_to_user": None,
                 "related_items": list(set(related_items)),
-                "inferred_purpose": intent,
+                "inferred_purpose": None,
                 "complexity": "low" if len(conditions) <= 1 else "medium",
                 "complexity_reason": f"Evaluates {len(conditions)} condition(s) and executes {len(actions)} pricing action(s).",
-                "questions_to_confirm": [
-                    f"Verify whether the pricing adjustments in '{name}' should apply to both new business and contract renewals.",
-                    "Should sales representatives have discretion to apply additional manual discounts on top of this rule?"
-                ],
+                "questions_to_confirm": [],
                 "data_gaps": []
             }
             return json.dumps(resp, indent=2)
@@ -223,18 +211,15 @@ class MockLLMClient(LLMClient):
 
             resp = {
                 "name": name,
-                "one_line_summary": f"Configurable {user_data.get('family', 'software')} bundle ({sku}) featuring {len(features)} feature section(s) and {total_opts} customizable components.",
-                "how_it_is_sold": f"Sold as a core package ({sku}) with guided component selections and automated rule governance.",
+                "one_line_summary": f"The extracted bundle has {len(features)} feature section(s) and {total_opts} option record(s).",
+                "how_it_is_sold": f"The extract records this product as a bundle with {total_opts} option record(s).",
                 "choices_offered": choices,
                 "ungrouped_options": ungrouped,
                 "rules_that_affect_it": [r.replace("Product Rule: ", "").replace("Price Rule: ", "") for r in user_data.get("affecting_rules", [])],
-                "pricing_notes": "Base package priced via standard price book with add-on options priced according to selected component terms.",
+                "pricing_notes": "Not available in extracted data.",
                 "complexity": complexity,
                 "complexity_reason": f"Contains {len(features)} feature section(s) with {total_opts} selectable option(s).",
-                "questions_to_confirm": [
-                    f"Are all {total_opts} component options within '{name}' actively sold and supported today?",
-                    "Should default quantities and selections be pre-populated to streamline quoting for sales reps?"
-                ],
+                "questions_to_confirm": [],
                 "data_gaps": []
             }
             return json.dumps(resp, indent=2)
@@ -245,9 +230,9 @@ class MockLLMClient(LLMClient):
             count = user_data.get("product_count", 0)
             resp = {
                 "family": fam,
-                "summary": f"The {fam} family contains {count} standalone offerings sold directly without component configuration.",
-                "typical_use": "Direct quotation and standard order placement.",
-                "governance_note": "Requires active price book entries for quotation."
+                "summary": f"The extract groups {count} products in the {fam} family.",
+                "typical_use": "Not available in extracted data.",
+                "governance_note": "Not available in extracted data."
             }
             return json.dumps(resp, indent=2)
 
@@ -257,33 +242,33 @@ class MockLLMClient(LLMClient):
             if "executive summary" in u_low or "executive" in u_low:
                 resp = {
                     "paragraphs": [
-                        "This document provides an executive summary of your Salesforce CPQ configuration. The catalog comprises {{active_products}} active products, designed to streamline how your sales representatives quote complex products and services.",
-                        "Within the catalog, {{total_bundles}} products are structured as configurable bundles containing {{total_features}} feature categories and {{total_options}} selectable components. An additional {{standalone_products}} products are offered as standalone items.",
-                        "Configuration integrity is protected by {{product_rules_total}} automated product rules and {{price_rules_total}} price rules. These rules prevent incompatible component selections and ensure pricing accuracy across every quote."
+                    "This document summarizes the extracted Salesforce CPQ catalog containing {{active_products}} active products and {{total_bundles}} configurable bundles.",
+                    "The extract records {{total_options}} option records across {{total_features}} feature records, plus {{product_rules_total}} product rules and {{price_rules_total}} price rules.",
+                    "The deterministic checks recorded {{observations_count}} observations for review."
                     ]
                 }
                 return json.dumps(resp, indent=2)
             elif "bundle" in u_low:
                 resp = {
                     "paragraphs": [
-                        "The commercial catalog structures products into {{total_bundles}} configurable bundle packages alongside {{standalone_products}} standalone items sold directly without sub-components.",
-                        "Each bundle guides sales representatives through {{total_features}} structured feature categories containing {{total_options}} selectable component options, ensuring technical compatibility and preventing quote errors."
+                        "The extract contains {{total_bundles}} configurable bundles and {{standalone_products}} products that are neither bundles nor bundle options.",
+                        "Those records contain {{total_features}} feature sections and {{total_options}} option records."
                     ]
                 }
                 return json.dumps(resp, indent=2)
             elif "rule" in u_low:
                 resp = {
                     "paragraphs": [
-                        "Product rules and price rules automate quotation governance and commercial calculations across the CPQ platform.",
-                        "The catalog is governed by {{product_rules_total}} product rules (enforcing validation limits and automatic component selection) alongside {{price_rules_total}} price rules that dynamically calculate list prices and package discounts."
+                        "The extract contains {{product_rules_total}} product rules and {{price_rules_total}} price rules.",
+                        "Each rule's extracted conditions and effects are listed in the rule details."
                     ]
                 }
                 return json.dumps(resp, indent=2)
             elif "pricing" in u_low or "price" in u_low:
                 resp = {
                     "paragraphs": [
-                        "Salesforce CPQ supports flexible monetization models across standard and dynamic catalog structures.",
-                        "Commercial pricing is driven by {{total_pricebook_entries}} price book entries across {{total_pricebooks}} active price books, complemented by automated price rules that calculate volume discounts and contract term adjustments."
+                        "The extract contains {{total_pricebook_entries}} pricebook entries across {{total_pricebooks}} pricebooks.",
+                        "It also contains {{total_block_prices}} block-price records and {{total_dimensions}} pricing-dimension records."
                     ]
                 }
                 return json.dumps(resp, indent=2)
@@ -422,4 +407,3 @@ def get_llm_client(provider_name: str = None) -> LLMClient:
         return BedrockClient()
     else:
         raise ValueError(f"Unknown LLM provider: '{provider}'. Available options: mock, gemini, anthropic, bedrock.")
-

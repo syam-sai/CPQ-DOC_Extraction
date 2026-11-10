@@ -49,6 +49,19 @@ def extract_all_text_from_sections(sections: dict) -> list[tuple[str, str]]:
         if r.get("inferred_purpose"):
             text_entries.append((f"Rule '{r_name}' Inferred Purpose", r.get("inferred_purpose", "")))
 
+    def collect_nested(context, value):
+        if isinstance(value, str):
+            text_entries.append((context, value))
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                collect_nested(f"{context}.{key}", child)
+        elif isinstance(value, list):
+            for idx, child in enumerate(value):
+                collect_nested(f"{context}[{idx}]", child)
+
+    for key in ("rule_details", "bundle_details", "data_quality", "product_prices", "changes"):
+        collect_nested(key, sections.get(key))
+
     return text_entries
 
 
@@ -84,6 +97,18 @@ def validate_document_content(facts: dict, sections: dict, raw_data: dict, run_d
                     "context": context,
                     "matched": m,
                 })
+        if re.search(r"\bspecified\s+value\b", text, re.IGNORECASE):
+            regex_violations.append({
+                "type": "Unresolved placeholder",
+                "context": context,
+                "matched": "Specified Value",
+            })
+        if re.search(r"\bappears to\b", text, re.IGNORECASE):
+            regex_violations.append({
+                "type": "Unsupported hedged purpose",
+                "context": context,
+                "matched": "Appears to",
+            })
 
     passed_regex = len(regex_violations) == 0
 

@@ -202,6 +202,16 @@ if selected and selected in st.session_state.instances:
     st.subheader(f"Connected Instance: {selected}")
     method_display = "Client credentials" if instance["auth_method"] == "client_credentials" else "Username + password"
     st.caption(f"Auth: `{method_display}` · Domain: `{instance['domain']}`")
+    include_inactive = st.checkbox(
+        "Include inactive products",
+        value=getattr(
+            config,
+            "INCLUDE_INACTIVE_RECORDS",
+            os.environ.get("CPQ_INCLUDE_INACTIVE_RECORDS", "false").lower()
+            in {"1", "true", "yes"},
+        ),
+        help="By default, extraction includes active products only.",
+    )
 
     if st.button("🔌 Connect & Extract Data", type="primary"):
         import importlib
@@ -240,10 +250,11 @@ if selected and selected in st.session_state.instances:
                 run_dir=run_dir,
                 extract_log=extract_log,
                 force_fresh=True,
+                include_inactive=include_inactive,
             )
             progress_bar.progress(0.6)
 
-            status_box.info("Staging and streaming 21-tab Excel & JSON with DuckDB...")
+            status_box.info("Staging and streaming Excel & JSON with DuckDB...")
             counts, trunc_log = transformer.transform_run(
                 run_dir=run_dir,
                 progress_callback=progress_cb,
@@ -337,7 +348,7 @@ if active_run and os.path.exists(active_run):
     if os.path.exists(out_xlsx):
         with open(out_xlsx, "rb") as f_xlsx:
             d_col2.download_button(
-                label="⬇️ Download Excel (21 Tabs)",
+                label="⬇️ Download Excel",
                 data=f_xlsx.read(),
                 file_name="cpq_extract.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

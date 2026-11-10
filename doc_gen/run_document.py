@@ -10,13 +10,15 @@ import argparse
 import logging
 from datetime import datetime
 
-from doc_gen.facts import compute_facts, load_extraction_data
+from doc_gen.facts import compute_facts, is_active_product, load_extraction_data
 from doc_gen.packets import build_packets
 from doc_gen.llm_client import get_llm_client, DEFAULT_MODEL_ANALYSIS, DEFAULT_MODEL_SYNTHESIS
 from doc_gen.analyze import run_all_analyses
 from doc_gen.synthesize import synthesize_all
 from doc_gen.validate import validate_document_content
 from doc_gen.render_docx import render_document
+from doc_gen.validators import validate_extraction
+from doc_gen.changes import build_change_summary
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,9 +43,29 @@ def update_status(doc_dir: str, state: str, step: str = "", progress: float = 0.
     os.replace(temp_file, status_file)
 
 
+def build_product_price_details(data: dict) -> list[dict]:
+    """Builds client-facing prices without passing exact prices to the LLM."""
+    return [
+        {
+            "product": (
+                f"{product.get('ProductCode')} - {product.get('Name')}"
+                if product.get("ProductCode") and product.get("Name")
+                else product.get("Name") or product.get("ProductCode") or "Unnamed product"
+            ),
+            "currency": entry.get("CurrencyIsoCode") or "Currency not available",
+            "unit_price": entry.get("UnitPrice"),
+        }
+        for product in data.get("Product", [])
+        if is_active_product(product)
+        for entry in product.get("pricebook_entries", [])
+        if entry.get("IsActive", True)
+    ]
+
+
 def run_pipeline(run_dir: str, client_name: str = "Client", dry_run: bool = False,
                  mock_llm: bool = False, render_only: bool = False,
-                 include_migration_notes: bool = False, progress_callback=None):
+                 include_migration_notes: bool = False, progress_callback=None,
+                 diff_path: str = None):
     """
     Executes the document generation pipeline.
     """
@@ -63,6 +85,17 @@ def run_pipeline(run_dir: str, client_name: str = "Client", dry_run: bool = Fals
     facts_file = os.path.join(doc_dir, "facts.json")
     log_progress("Step 1/5: Computing deterministic catalog facts and observations...", 0.15)
     facts = compute_facts(run_dir)
+    extracted_data = load_extraction_data(run_dir)
+    data_quality = list(extracted_data.get("data_quality", []))
+    for finding in validate_extraction(extracted_data, facts=facts):
+        if finding not in data_quality:
+            data_quality.append(finding)
+    facts["data_quality"] = data_quality
+    facts["data_quality_errors"] = sum(
+        finding.get("severity") == "ERROR" for finding in data_quality
+    )
+    with open(os.path.join(doc_dir, "data_quality.json"), "w", encoding="utf-8") as f:
+        json.dump(data_quality, f, indent=2)
     with open(facts_file, "w", encoding="utf-8") as f:
         json.dump(facts, f, indent=2)
 
@@ -126,6 +159,10 @@ def run_pipeline(run_dir: str, client_name: str = "Client", dry_run: bool = Fals
             sections = json.load(f)
 
         raw_data = load_extraction_data(run_dir)
+        sections.setdefault("product_prices", build_product_price_details(raw_data))
+        sections.setdefault("data_quality", facts.get("data_quality", []))
+        if diff_path:
+            sections["changes"] = build_change_summary(raw_data, diff_path)
         val_report = validate_document_content(facts, sections, raw_data, run_dir=run_dir)
         if not val_report.get("can_render"):
             raise ValueError(f"Regex check failed! Rendering blocked: {val_report.get('regex_check')}")
@@ -162,12 +199,18 @@ def run_pipeline(run_dir: str, client_name: str = "Client", dry_run: bool = Fals
         run_dir=run_dir,
         client=llm_client,
         model=DEFAULT_MODEL_SYNTHESIS,
+        packets_result=packets_result,
         progress_callback=lambda msg: update_status(doc_dir, "running", step=msg, progress=0.85),
     )
+    raw_data = load_extraction_data(run_dir)
+    sections["product_prices"] = build_product_price_details(raw_data)
+    if diff_path:
+        sections["changes"] = build_change_summary(raw_data, diff_path)
+    with open(sections_file, "w", encoding="utf-8") as f:
+        json.dump(sections, f, indent=2)
 
     # 5. Phase C: Validation & Regex Check
     log_progress("Step 5/5: Running validation and regex security checks...", 0.90)
-    raw_data = load_extraction_data(run_dir)
     validation_report = validate_document_content(
         facts=facts,
         sections=sections,
@@ -209,6 +252,11 @@ def main():
     parser.add_argument("--mock-llm", action="store_true", help="Use offline deterministic mock LLM provider")
     parser.add_argument("--render-only", action="store_true", help="Re-render docx from existing sections.json without LLM calls")
     parser.add_argument("--include-migration-notes", action="store_true", help="Include optional section on migration and change-management care areas")
+    parser.add_argument(
+        "--diff",
+        dest="diff_path",
+        help="Compare this extraction JSON and add a deterministic 'What changed' section.",
+    )
 
     args = parser.parse_args()
 
@@ -220,6 +268,7 @@ def main():
             mock_llm=args.mock_llm,
             render_only=args.render_only,
             include_migration_notes=args.include_migration_notes,
+            diff_path=args.diff_path,
         )
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
@@ -228,4 +277,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

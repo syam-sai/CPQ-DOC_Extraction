@@ -17,7 +17,9 @@ import os
 import csv
 import json
 import logging
+import re
 from collections import defaultdict
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +238,103 @@ def group_by_fk(records, fk_field, valid_parent_ids=None):
     return grouped
 
 
-def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extract_log=None, force_fresh=True):
+def _configuration_attribute_metadata(sf, records):
+    """Adds the Product2 field type and active picklist choices to each attribute."""
+    fields = {
+        field.get("name"): field
+        for field in get_object_describe(sf, "Product2").get("fields", [])
+        if field.get("name")
+    }
+    enriched = []
+    for record in records:
+        target_field = record.get("SBQQ__TargetField__c")
+        field_info = fields.get(target_field, {})
+        attribute = dict(record)
+        if field_info:
+            attribute["TargetFieldLabel"] = field_info.get("label")
+            attribute["TargetFieldType"] = field_info.get("type")
+            if field_info.get("type") in {"picklist", "multipicklist"}:
+                attribute["TargetFieldPicklistValues"] = [
+                    item.get("value")
+                    for item in field_info.get("picklistValues", [])
+                    if item.get("active", True) and item.get("value")
+                ]
+        enriched.append(attribute)
+    return enriched
+
+
+def _collect_extraction_metadata(sf, include_inactive=False):
+    """Collects org and package metadata without making metadata failure fatal."""
+    metadata = {
+        "org_id": None,
+        "is_sandbox": None,
+        "instance": getattr(sf, "sf_instance", None),
+        "extraction_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "cpq_package_version": None,
+        "extractor_version": "1.0.0",
+        "json_schema_version": "1.0.0",
+        "include_inactive_records": include_inactive,
+        "inactive_products_count": None,
+    }
+    errors = []
+    try:
+        org_result = sf.query("SELECT Id, IsSandbox FROM Organization LIMIT 1")
+        organizations = org_result.get("records", [])
+        if organizations:
+            metadata["org_id"] = organizations[0].get("Id")
+            metadata["is_sandbox"] = organizations[0].get("IsSandbox")
+    except Exception as exc:
+        logger.warning("Could not retrieve Salesforce organization metadata: %s", exc)
+        errors.append("Salesforce organization metadata could not be retrieved.")
+
+    try:
+        inactive_result = sf.query(
+            "SELECT COUNT() inactiveCount FROM Product2 WHERE IsActive = false"
+        )
+        inactive_rows = inactive_result.get("records", [])
+        if inactive_rows:
+            metadata["inactive_products_count"] = inactive_rows[0].get("inactiveCount")
+    except Exception as exc:
+        logger.warning("Could not retrieve inactive product count: %s", exc)
+        errors.append("Inactive product count could not be retrieved.")
+
+    try:
+        package_result = sf.query(
+            "SELECT SubscriberPackageVersion.MajorVersion, "
+            "SubscriberPackageVersion.MinorVersion, "
+            "SubscriberPackageVersion.PatchVersion, "
+            "SubscriberPackageVersion.BuildNumber "
+            "FROM InstalledSubscriberPackage "
+            "WHERE SubscriberPackage.NamespacePrefix = 'SBQQ' LIMIT 1"
+        )
+        packages = package_result.get("records", [])
+        if packages:
+            version = packages[0].get("SubscriberPackageVersion") or {}
+            version_parts = [
+                version.get("MajorVersion"),
+                version.get("MinorVersion"),
+                version.get("PatchVersion"),
+                version.get("BuildNumber"),
+            ]
+            metadata["cpq_package_version"] = ".".join(
+                str(part) for part in version_parts if part is not None
+            ) or None
+    except Exception as exc:
+        logger.warning("Could not retrieve Salesforce CPQ package version: %s", exc)
+        errors.append("Salesforce CPQ package version could not be retrieved.")
+
+    return metadata, errors
+
+
+def extract_all(
+    sf,
+    progress_callback=None,
+    run_dir=None,
+    use_bulk=False,
+    extract_log=None,
+    force_fresh=True,
+    include_inactive=False,
+):
     """
     Extracts all active CPQ configuration.
     Returns (data, counts, extract_log).
@@ -254,23 +352,28 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
             return None
         return os.path.join(run_dir, "raw", f"{obj_name}.csv")
 
+    if isinstance(include_inactive, str):
+        include_inactive = include_inactive.strip().lower() in {"1", "true", "yes"}
+    product_filter = "" if include_inactive else " WHERE IsActive = true"
+
     # 1. Active Products
-    step("Pulling active products...")
+    step("Pulling products...")
     products = query_table(
         sf, "Product2",
-        where_clause=f"{PRODUCT_ACTIVE_FIELD} = true",
+        where_clause=None if include_inactive else f"{PRODUCT_ACTIVE_FIELD} = true",
         raw_path=raw_file("Product2"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
         extract_log=extract_log,
     )
     product_ids = set(p["Id"] for p in products)
+    product_semijoin = f"SELECT Id FROM Product2{product_filter}"
 
     # 2. Product Child Objects with Server-Side Semi-Joins
     step("Pulling product child objects...")
     pricebook_entries_raw = query_table(
         sf, "PricebookEntry",
-        where_clause="Product2Id IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"Product2Id IN ({product_semijoin})",
         raw_path=raw_file("PricebookEntry"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -278,7 +381,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     block_prices_raw = query_table(
         sf, "SBQQ__BlockPrice__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__BlockPrice__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -286,7 +389,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     costs_raw = query_table(
         sf, "SBQQ__Cost__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__Cost__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -294,7 +397,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     dimensions_raw = query_table(
         sf, "SBQQ__Dimension__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__Dimension__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -302,7 +405,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     discount_schedules_raw = query_table(
         sf, "SBQQ__DiscountSchedule__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__DiscountSchedule__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -310,7 +413,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     price_schedules_raw = query_table(
         sf, "SBQQ__PriceSchedule__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__PriceSchedule__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -318,7 +421,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     features_raw = query_table(
         sf, "SBQQ__ProductFeature__c",
-        where_clause="SBQQ__ConfiguredSKU__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__ConfiguredSKU__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__ProductFeature__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -326,7 +429,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     options_raw = query_table(
         sf, "SBQQ__ProductOption__c",
-        where_clause="SBQQ__ConfiguredSKU__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__ConfiguredSKU__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__ProductOption__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -334,7 +437,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     constraints_raw = query_table(
         sf, "SBQQ__OptionConstraint__c",
-        where_clause="SBQQ__ConfiguredSKU__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__ConfiguredSKU__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__OptionConstraint__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -342,7 +445,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     )
     config_attrs_raw = query_table(
         sf, "SBQQ__ConfigurationAttribute__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         raw_path=raw_file("SBQQ__ConfigurationAttribute__c"),
         use_bulk=use_bulk,
         force_fresh=force_fresh,
@@ -352,7 +455,7 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     # Configuration Rules (Dual Parent: Product OR ProductRule)
     cr_prod = query_table(
         sf, "SBQQ__ConfigurationRule__c",
-        where_clause="SBQQ__Product__c IN (SELECT Id FROM Product2 WHERE IsActive = true)",
+        where_clause=f"SBQQ__Product__c IN ({product_semijoin})",
         use_bulk=use_bulk,
         force_fresh=force_fresh,
         extract_log=extract_log,
@@ -392,7 +495,15 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
     features_by_product = group_by_fk(features_raw, "SBQQ__ConfiguredSKU__c", product_ids)
     options_by_bundle = group_by_fk(options_raw, "SBQQ__ConfiguredSKU__c", product_ids)
     constraints_by_bundle = group_by_fk(constraints_raw, "SBQQ__ConfiguredSKU__c", product_ids)
-    config_attrs_by_product = group_by_fk(config_attrs_raw, "SBQQ__Product__c", product_ids)
+    config_attrs_enriched = _configuration_attribute_metadata(sf, config_attrs_raw)
+    if raw_file("SBQQ__ConfigurationAttribute__c"):
+        write_records_to_csv(
+            config_attrs_enriched,
+            raw_file("SBQQ__ConfigurationAttribute__c"),
+        )
+    config_attrs_by_product = group_by_fk(
+        config_attrs_enriched, "SBQQ__Product__c", product_ids
+    )
     config_rules_by_product = group_by_fk(config_rules_raw, "SBQQ__Product__c", product_ids)
     price_rules_by_product = group_by_fk(price_rules_raw, "SBQQ__Product__c", product_ids)
 
@@ -554,6 +665,29 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         "PriceRules": nested_price_rules,
         "SummaryVariables": summary_variables,
     }
+    metadata, metadata_errors = _collect_extraction_metadata(
+        sf, include_inactive=include_inactive
+    )
+    data["metadata"] = metadata
+
+    from doc_gen.facts import compute_facts
+    from doc_gen.validators import validate_extraction
+
+    data_quality = validate_extraction(data, facts=compute_facts(data))
+    for metadata_error in metadata_errors:
+        data_quality.append({
+            "severity": "WARNING",
+            "entity": "metadata",
+            "message": metadata_error,
+        })
+    for object_name, status in extract_log.items():
+        if status.get("status") == "failed":
+            data_quality.append({
+                "severity": "ERROR",
+                "entity": "extraction",
+                "message": f"Extraction of {object_name} failed; results may be incomplete.",
+            })
+    data["data_quality"] = data_quality
 
     counts = {
         "Product": len(nested_products),
@@ -570,5 +704,9 @@ def extract_all(sf, progress_callback=None, run_dir=None, use_bulk=False, extrac
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "extract_log.json"), "w", encoding="utf-8") as f:
             json.dump(extract_log, f, indent=2)
+        with open(os.path.join(run_dir, "extraction_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+        with open(os.path.join(run_dir, "data_quality.json"), "w", encoding="utf-8") as f:
+            json.dump(data_quality, f, indent=2)
 
     return data, counts

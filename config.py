@@ -14,6 +14,11 @@ load_dotenv()  # no-op in AWS if there's no .env file present
 # and/or the "load from Secrets Manager" panel.
 APP_ENV = os.environ.get("APP_ENV", "local")
 
+# Include inactive Salesforce products in extraction output when explicitly enabled.
+INCLUDE_INACTIVE_RECORDS = os.environ.get(
+    "CPQ_INCLUDE_INACTIVE_RECORDS", "false"
+).lower() in {"1", "true", "yes"}
+
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # If set, every extraction is also written to this S3 bucket in addition

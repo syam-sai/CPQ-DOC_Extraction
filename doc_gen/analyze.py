@@ -24,14 +24,19 @@ helps sales teams configure products and price quotes). Readers are business peo
 technical or Salesforce knowledge.
 You receive ONE packet of configuration data as JSON. Names are already resolved; there are no IDs.
 Rules:
-1. Describe only what the packet shows. Do not guess beyond it. If you infer a business purpose, put it
-   only in inferred_purpose and phrase it with "appears to".
+1. Use only facts in the packet. Do not invent intent, percentages, tiers, or behavior. If a
+   purpose follows directly from the rule data, put it in inferred_purpose; otherwise use null.
 2. Use the exact product, feature, option and rule names from the packet. Never invent names.
 3. Copy any user-facing message text exactly as written in the data; otherwise null.
-4. Do not write numbers unless they appear in the packet.
-5. Plain language: short sentences, no jargon, no field/API names (nothing like SBQQ__), no acronyms
+4. Describe each condition using its resolved operator and actual value. If the value is
+   "VALUE NOT RESOLVED", say that it is unavailable; never substitute a guessed value.
+5. Describe each action separately and preserve its action type and target. Never combine
+   opposing actions into one sentence.
+6. Do not write numbers unless they appear in the packet.
+7. Plain language: short sentences, no jargon, no field/API names (nothing like SBQQ__), no acronyms
    unless defined. Write "the sales rep" for the person building the quote.
-6. If something is missing or unclear, add it to data_gaps and questions_to_confirm instead of guessing.
+8. Ask only specific questions tied to a real ambiguity in the packet. If something is missing,
+   add it to data_gaps and questions_to_confirm instead of guessing.
 Return ONLY valid JSON matching the schema supplied below. No markdown, no commentary."""
 
 
@@ -43,7 +48,7 @@ RULE_OUTPUT_SCHEMA = """{
   "what_it_does": "<plain English: what the system does as a result>",
   "message_shown_to_user": "<exact message text from the packet, or null>",
   "related_items": ["<product, feature, or summary variable names this rule touches>"],
-  "inferred_purpose": "<starts with 'Appears to ...', or null>",
+  "inferred_purpose": "<directly supported purpose, or null>",
   "complexity": "low | medium | high",
   "complexity_reason": "<one short sentence>",
   "questions_to_confirm": ["<short question for the client's team>"],
@@ -106,10 +111,10 @@ def validate_rule_analysis(data: dict) -> tuple[bool, str]:
     if str(data.get("complexity", "")).lower() not in valid_complexities:
         return False, f"Invalid 'complexity': '{data.get('complexity')}'. Must be one of {valid_complexities}"
 
-    # Verify inferred_purpose uses 'appears to' if provided
-    inferred = data.get("inferred_purpose")
-    if inferred and "appears to" not in inferred.lower():
-        return False, "Field 'inferred_purpose' must be null or phrased using 'appears to'."
+    if not isinstance(data.get("questions_to_confirm"), list):
+        return False, "Field 'questions_to_confirm' must be a list."
+    if not isinstance(data.get("data_gaps"), list):
+        return False, "Field 'data_gaps' must be a list."
 
     return True, ""
 
@@ -324,4 +329,3 @@ def run_all_analyses(packets_dict: dict, run_dir: str, client: LLMClient = None,
 
     step(f"Completed analysis of all {total_count} packets.")
     return results
-

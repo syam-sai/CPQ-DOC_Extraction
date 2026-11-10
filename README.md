@@ -1,6 +1,8 @@
 # Salesforce CPQ Configuration Extractor & Client Document Generator
 
-A local-first, AWS-ready pipeline that extracts active Salesforce CPQ (`SBQQ__`) configuration, normalizes relational structures into streaming NDJSON and a 21-tab Excel workbook, and transforms complex technical setup into an executive, client-shareable Word document (`.docx`).
+A local-first, AWS-ready pipeline that extracts Salesforce CPQ (`SBQQ__`) configuration, normalizes relational structures into streaming NDJSON and a 23-tab Excel workbook, and transforms complex technical setup into an executive, client-shareable Word document (`.docx`).
+
+Inactive products are excluded by default. Set `CPQ_INCLUDE_INACTIVE_RECORDS=true` in the local environment or select **Include inactive products** in the Streamlit app to include them in the JSON/XLSX extract. The summary still distinguishes active and inactive products.
 
 ---
 
@@ -78,7 +80,7 @@ The `doc_gen/` package turns the raw technical extraction into a non-technical, 
   - Numbers in synthesis use placeholders (`{{active_products}}`) substituted directly from `facts.json`.
   - Offline testing supported via `--mock-llm` and `--dry-run`.
 
-### Document Structure (9 Sections)
+### Document Structure (10 Sections)
 1. **Executive Summary**: High-level overview of the sales setup, catalog scale, and key focus areas.
 2. **How to Read This Document**: Plain-English glossary for non-Salesforce stakeholders.
 3. **Your Catalog at a Glance**: Summary facts, products by family table, and rules breakdown.
@@ -87,7 +89,10 @@ The `doc_gen/` package turns the raw technical extraction into a non-technical, 
 6. **How Pricing Works**: High-level pricing models (block pricing, recurring dimensions, subscription terms).
 7. **Things Worth a Closer Look**: Objective observations (bundles without features, unpriced products, empty rule actions).
 8. **Questions to Confirm with Your Team**: Clarifications for sales and operations teams.
-9. **Appendix**: Technical cross-reference (Salesforce object names, files, and mapping notes).
+9. **Scope and Limitations**: Items not extracted that may affect quoting behavior.
+10. **Appendix**: Technical cross-reference, metadata, and output files.
+
+The generation pipeline adds deterministic findings to `data_quality` in JSON and to the workbook's **Data Quality** tab before LLM analysis. The XLSX also contains an **Extraction Metadata** tab. Documents with ERROR-level findings are labeled **DRAFT - DATA ISSUES**.
 
 ---
 
@@ -107,3 +112,10 @@ python run_document.py --run data/runs/sample_org/20261015_150908 --dry-run
 ```bash
 python run_document.py --run data/runs/sample_org/20261015_150908 --render-only
 ```
+
+### Compare Against a Previous Extraction
+```bash
+python run_document.py --run data/runs/sample_org/20261015_150908 --client-name "Acme Corp" --diff data/runs/sample_org/20261001_120000/output/cpq_extract.json
+```
+
+The generated document includes a deterministic summary of added, removed, and modified products, rules, and prices.

@@ -1,6 +1,6 @@
 # xlsx_export.py
 #
-# Converts the nested extraction JSON into a 21-tab Excel workbook:
+# Converts the nested extraction JSON into a 23-tab Excel workbook:
 #   4 main sheets (Products, Product Rules, Price Rules, Summary Variables)
 #   17 child-detail sheets, each carrying explicit Parent_*_Id columns
 #
@@ -329,6 +329,31 @@ def build_workbook(data, truncation_log=None, countif_max_products=DEFAULT_COUNT
     )
 
     write_sheet(wb, "Summary Variables", summary_var_rows, id_columns=[], truncation_log=truncation_log)
+    quality_rows = [
+        {
+            "Severity": finding.get("severity"),
+            "Entity": finding.get("entity"),
+            "Rule": finding.get("rule"),
+            "Product": finding.get("product"),
+            "Message": finding.get("message"),
+        }
+        for finding in data.get("data_quality", [])
+    ]
+    write_sheet(
+        wb,
+        "Data Quality",
+        quality_rows or [{"Message": "No data-quality findings were recorded."}],
+        id_columns=[],
+        truncation_log=truncation_log,
+    )
+    metadata_rows = [
+        {"Field": key, "Value": value}
+        for key, value in data.get("metadata", {}).items()
+    ] or [{"Field": "metadata", "Value": "Not available"}]
+    write_sheet(
+        wb, "Extraction Metadata", metadata_rows, id_columns=[],
+        truncation_log=truncation_log
+    )
 
     # Put the 4 main sheets first, in sensible reading order
     main_order = ["Products", "Product Rules", "Price Rules", "Summary Variables"]
@@ -341,7 +366,7 @@ def build_workbook(data, truncation_log=None, countif_max_products=DEFAULT_COUNT
 
 
 def save_workbook(data, filepath, truncation_log=None, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS):
-    """Builds and saves the 21-tab workbook to filepath."""
+    """Builds and saves the 23-tab workbook to filepath."""
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     wb = build_workbook(data, truncation_log=truncation_log, countif_max_products=countif_max_products)
     wb.save(filepath)

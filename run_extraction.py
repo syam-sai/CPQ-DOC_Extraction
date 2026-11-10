@@ -14,6 +14,7 @@ import sf_auth
 import extractor
 import transformer
 import storage
+import config
 from synthetic_data import generate_synthetic_csvs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -39,7 +40,8 @@ def update_status(run_dir: str, state: str, step: str = "", progress: float = 0.
 
 
 def run_extraction_cli(instance_name: str = None, run_id: str = None, fixture_path: str = None,
-                       use_bulk: bool = False, credentials: dict = None):
+                       use_bulk: bool = False, credentials: dict = None,
+                       include_inactive: bool = config.INCLUDE_INACTIVE_RECORDS):
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     instance_label = instance_name or (os.path.basename(fixture_path) if fixture_path else "default")
     run_dir = os.path.abspath(os.path.join("data", "runs", instance_label, run_id))
@@ -107,6 +109,7 @@ def run_extraction_cli(instance_name: str = None, run_id: str = None, fixture_pa
                 run_dir=run_dir,
                 use_bulk=use_bulk,
                 extract_log=extract_log,
+                include_inactive=include_inactive,
             )
 
         # Transform and stream output
@@ -132,6 +135,12 @@ def main():
     parser.add_argument("--run-id", help="Optional run identifier (defaults to timestamp)")
     parser.add_argument("--fixture", help="Offline fixture path (.json or raw directory)")
     parser.add_argument("--use-bulk", action="store_true", help="Use Bulk API 2.0 when possible")
+    parser.add_argument(
+        "--include-inactive",
+        action="store_true",
+        default=config.INCLUDE_INACTIVE_RECORDS,
+        help="Include inactive products (excluded by default).",
+    )
 
     args = parser.parse_args()
 
@@ -141,6 +150,7 @@ def main():
             run_id=args.run_id,
             fixture_path=args.fixture,
             use_bulk=args.use_bulk,
+            include_inactive=args.include_inactive,
         )
     except Exception as e:
         sys.exit(1)
@@ -148,4 +158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -5,20 +5,35 @@
 
 import os
 import json
-import logging
+import re
 from doc_gen.llm_client import LLMClient, get_llm_client, DEFAULT_MODEL_SYNTHESIS
 from doc_gen.analyze import clean_llm_json
 
-logger = logging.getLogger(__name__)
+INCLUDE_PERSONAL_DATA = os.environ.get(
+    "LLM_INCLUDE_PERSONAL_DATA", "false"
+).lower() in {"1", "true", "yes"}
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
-SYNTHESIS_SYSTEM_PROMPT = """You are writing a section of a high-level, client-shareable document about a company's Salesforce CPQ setup.
-Readers are senior business executives with no technical or Salesforce knowledge.
-Rules:
-1. Write in clear, professional business English. Short, impactful paragraphs.
-2. No technical jargon, no field names, no acronyms unless explained.
-3. NEVER write numbers directly. Instead, you MUST use the exact placeholder tags provided (e.g. {{active_products}}, {{total_bundles}}). The code will inject the verified numbers.
-4. Lead with what the setup enables for sales representatives and the quoting process, then scale, then areas deserving leadership attention.
-Return ONLY valid JSON with a "paragraphs" list of strings. No markdown formatting, no commentary."""
+
+def _sanitize_prompt_value(value):
+    if INCLUDE_PERSONAL_DATA:
+        return value
+    if isinstance(value, str):
+        return EMAIL_RE.sub("[email redacted]", value)
+    if isinstance(value, list):
+        return [_sanitize_prompt_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_prompt_value(item) for key, item in value.items()}
+    return value
+
+
+SYNTHESIS_SYSTEM_PROMPT = """Write for business readers in plain, active English.
+Use ONLY facts supplied in the prompt. Do not invent intent, behavior, tiers, percentages,
+or product capabilities. If a fact is missing, say "Not available in extracted data".
+Do not use generic filler, unsupported business claims, or technical API names. Explain
+abbreviations on first use. Use only the metric placeholders explicitly listed by the user
+prompt; never write a metric number directly. Keep each paragraph focused on one idea.
+Return only valid JSON with a "paragraphs" array of strings."""
 
 
 def build_placeholder_map(facts: dict) -> dict:
@@ -54,9 +69,61 @@ def substitute_placeholders(text: str, placeholder_map: dict) -> str:
     return out
 
 
+def _parse_paragraph_response(raw_response, placeholder_map):
+    parsed = json.loads(clean_llm_json(raw_response))
+    if not isinstance(parsed, dict) or set(parsed) != {"paragraphs"}:
+        raise ValueError("Response must be an object containing only 'paragraphs'.")
+    paragraphs = parsed["paragraphs"]
+    if (
+        not isinstance(paragraphs, list)
+        or not paragraphs
+        or any(not isinstance(paragraph, str) or not paragraph.strip() for paragraph in paragraphs)
+    ):
+        raise ValueError("'paragraphs' must be a non-empty array of non-empty strings.")
+    resolved = [
+        substitute_placeholders(paragraph, placeholder_map)
+        for paragraph in paragraphs
+    ]
+    unresolved = [
+        paragraph for paragraph in resolved
+        if re.search(r"\{\{[^{}]+\}\}", paragraph)
+    ]
+    if unresolved:
+        raise ValueError("Response contains an unknown metric placeholder.")
+    return resolved
+
+
+def _generate_paragraphs(client, user_prompt, placeholder_map, model, section, max_tokens):
+    response = client.generate(
+        SYNTHESIS_SYSTEM_PROMPT,
+        user_prompt,
+        max_tokens=max_tokens,
+        model=model,
+    )
+    for attempt in range(2):
+        try:
+            return _parse_paragraph_response(response, placeholder_map)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            if attempt == 1:
+                raise ValueError(
+                    f"{section} synthesis returned invalid structured JSON after one retry: {exc}"
+                ) from exc
+            response = client.generate(
+                SYNTHESIS_SYSTEM_PROMPT,
+                (
+                    f"{user_prompt}\n\nYour previous response failed schema validation: "
+                    f"{exc}. Return only an object with a non-empty 'paragraphs' "
+                    "array of non-empty strings, and use only listed placeholders."
+                ),
+                max_tokens=max_tokens,
+                model=model,
+            )
+    raise RuntimeError(f"{section} synthesis produced no response.")
+
+
 def synthesize_all(facts: dict, analyses_dict: dict, run_dir: str,
                    client: LLMClient = None, model: str = DEFAULT_MODEL_SYNTHESIS,
-                   progress_callback=None) -> dict:
+                   progress_callback=None, packets_result: dict = None) -> dict:
     """
     Synthesizes executive summary and high-level section narratives.
     Produces run_dir/doc/sections.json.
@@ -109,37 +176,15 @@ Available metric placeholders you MUST use:
 
 Key context:
 - Catalog breakdown by family: {json.dumps(facts.get('products_by_family', {}))}
-- Observations: {[obs.get('description') for obs in facts.get('observations', [])]}
+- Observations: {json.dumps(_sanitize_prompt_value([obs.get('description') for obs in facts.get('observations', [])]))}
+- Data quality findings: {json.dumps(_sanitize_prompt_value(facts.get('data_quality', [])))}
 
 Return JSON: {{"paragraphs": ["paragraph 1", "paragraph 2", "paragraph 3"]}}"""
 
-    raw_exec = client.generate(SYNTHESIS_SYSTEM_PROMPT, exec_user_prompt, max_tokens=1500, model=model)
-    try:
-        exec_json = json.loads(clean_llm_json(raw_exec))
-        exec_paragraphs = [
-            substitute_placeholders(p, placeholder_map) for p in exec_json.get("paragraphs", [])
-        ]
-    except Exception as e:
-        logger.warning(f"Executive summary JSON parse error: {e}. Using fallback structure.")
-        exec_paragraphs = [
-            substitute_placeholders(
-                "This document provides a comprehensive, non-technical overview of your Salesforce CPQ setup. "
-                "The active commercial catalog encompasses {{active_products}} products, including {{total_bundles}} "
-                "configured product bundles and {{standalone_products}} standalone items sold directly without component configuration.",
-                placeholder_map
-            ),
-            substitute_placeholders(
-                "Configured bundles offer a combined {{total_options}} component options structured across {{total_features}} "
-                "distinct feature categories. Sales quotation accuracy is maintained by {{product_rules_total}} product rules "
-                "and {{price_rules_total}} pricing rule, preventing invalid configurations and standardizing pricing across teams.",
-                placeholder_map
-            ),
-            substitute_placeholders(
-                "Our analysis identified {{observations_count}} catalog configuration item(s) deserving closer team review, "
-                "such as products without active pricebook entries and bundles structured with flat component lists.",
-                placeholder_map
-            ),
-        ]
+    exec_paragraphs = _generate_paragraphs(
+        client, exec_user_prompt, placeholder_map, model,
+        "Executive summary", max_tokens=1500,
+    )
 
     # 2. Synthesize Bundling & Configuration Section Narrative
     step("Synthesizing Bundles narrative...")
@@ -149,84 +194,37 @@ Placeholders available: {{{{total_bundles}}}}, {{{{standalone_products}}}}, {{{{
 Sample bundle structures analyzed: {[b.get('name') for b in bundle_analyses[:8]]}
 Return JSON: {{"paragraphs": ["..."]}}"""
 
-    raw_bundles = client.generate(SYNTHESIS_SYSTEM_PROMPT, bundles_user_prompt, max_tokens=1000, model=model)
-    try:
-        b_json = json.loads(clean_llm_json(raw_bundles))
-        bundle_paragraphs = [
-            substitute_placeholders(p, placeholder_map) for p in b_json.get("paragraphs", [])
-        ]
-    except Exception:
-        bundle_paragraphs = [
-            substitute_placeholders(
-                "The product catalog leverages guided selling principles to simplify quoting. Products are organized into "
-                "{{total_bundles}} configurable bundle offerings and {{standalone_products}} standalone items.",
-                placeholder_map
-            ),
-            substitute_placeholders(
-                "Bundles structure complex products into {{total_features}} clear feature sections containing {{total_options}} "
-                "selectable components. Sales representatives select appropriate hardware, software, and services while "
-                "automated validation logic ensures component compatibility.",
-                placeholder_map
-            )
-        ]
+    bundle_paragraphs = _generate_paragraphs(
+        client, bundles_user_prompt, placeholder_map, model,
+        "Bundle overview", max_tokens=1000,
+    )
 
     # 3. Synthesize Business Rules Section Narrative
     step("Synthesizing Rules narrative...")
     rules_user_prompt = f"""Write an introduction to the Product Rules and Price Rules section (2 paragraphs).
-Explain how validation, auto-addition, and alert rules safeguard quote quality.
+Describe only the rule types represented in the supplied counts. Do not infer business intent.
 Placeholders available: {{{{product_rules_total}}}}, {{{{validation_rules_count}}}}, {{{{selection_rules_count}}}}, {{{{alert_rules_count}}}}, {{{{price_rules_total}}}}.
 Rule types present: {json.dumps(facts.get('product_rules', {}).get('by_type', {}))}
 Return JSON: {{"paragraphs": ["..."]}}"""
 
-    raw_rules = client.generate(SYNTHESIS_SYSTEM_PROMPT, rules_user_prompt, max_tokens=1000, model=model)
-    try:
-        r_json = json.loads(clean_llm_json(raw_rules))
-        rule_paragraphs = [
-            substitute_placeholders(p, placeholder_map) for p in r_json.get("paragraphs", [])
-        ]
-    except Exception:
-        rule_paragraphs = [
-            substitute_placeholders(
-                "Product rules and price rules automate quotation governance, ensuring quotes conform to technical prerequisites "
-                "and corporate sales policies without requiring manual engineering oversight.",
-                placeholder_map
-            ),
-            substitute_placeholders(
-                "Your setup contains {{product_rules_total}} product rules and {{price_rules_total}} price rules. "
-                "Product rules automatically validate selections and add mandatory prerequisites, while price rules dynamically "
-                "calculate list prices and enforce approved package discounting.",
-                placeholder_map
-            )
-        ]
+    rule_paragraphs = _generate_paragraphs(
+        client, rules_user_prompt, placeholder_map, model,
+        "Rule overview", max_tokens=1000,
+    )
 
     # 4. Synthesize Pricing Section Narrative
     step("Synthesizing Pricing narrative...")
     pricing_user_prompt = f"""Write an overview of Pricing Models in the catalog (2 paragraphs).
-Explain that pricing follows standard list pricing alongside specialized models:
+Report only extracted pricing records:
 - Block Pricing: {{{{total_block_prices}}}} block price tier(s) for tiered pricing
 - Multi-dimensional pricing: {{{{total_dimensions}}}} recurring service dimension(s)
 - Pricebooks: {{{{total_pricebook_entries}}}} active pricebook entry items across {{{{total_pricebooks}}}} pricebook(s)
 Return JSON: {{"paragraphs": ["..."]}}"""
 
-    raw_pricing = client.generate(SYNTHESIS_SYSTEM_PROMPT, pricing_user_prompt, max_tokens=1000, model=model)
-    try:
-        p_json = json.loads(clean_llm_json(raw_pricing))
-        pricing_paragraphs = [
-            substitute_placeholders(p, placeholder_map) for p in p_json.get("paragraphs", [])
-        ]
-    except Exception:
-        pricing_paragraphs = [
-            substitute_placeholders(
-                "The commercial catalog establishes transparent pricing logic across all products. Standard pricing is driven by "
-                "{{total_pricebook_entries}} price book entries across {{total_pricebooks}} active price book(s).",
-                placeholder_map
-            ),
-            substitute_placeholders(
-                "To support modern commercial models, specialized pricing structures are active: {{total_block_prices}} block price "
-                "schedule(s) for quantity-bracket pricing, and {{total_dimensions}} multi-dimensional recurring dimension(s) for service agreements.",
-                placeholder_map
-            )
-        ]
+    pricing_paragraphs = _generate_paragraphs(
+        client, pricing_user_prompt, placeholder_map, model,
+        "Pricing overview", max_tokens=1000,
+    )
 
     sections = {
         "executive_summary": exec_paragraphs,
@@ -239,6 +237,12 @@ Return JSON: {{"paragraphs": ["..."]}}"""
         "rule_analyses": rule_analyses,
         "standalone_analyses": standalone_analyses,
         "observations": facts.get("observations", []),
+        "data_quality": facts.get("data_quality", []),
+        "rule_details": {
+            "product_rules": (packets_result or {}).get("product_rule_packets", []),
+            "price_rules": (packets_result or {}).get("price_rule_packets", []),
+        },
+        "bundle_details": (packets_result or {}).get("bundle_packets", []),
     }
 
     with open(sections_file, "w", encoding="utf-8") as f:
@@ -246,4 +250,3 @@ Return JSON: {{"paragraphs": ["..."]}}"""
 
     step("Sections synthesis complete.")
     return sections
-

@@ -4,7 +4,7 @@
 #   - Loads raw CSVs from raw/
 #   - Streams NDJSON (one product per line) to output/cpq_extract.ndjson
 #   - Streams full JSON to output/cpq_extract.json
-#   - Streams 21-tab XLSX to output/cpq_extract.xlsx
+#   - Streams 23-tab XLSX to output/cpq_extract.xlsx
 #   - Keeps peak memory flat (under 150 MB) even for 10,000+ products
 #   - Supports rollup COUNTIF formulas (<= 5,000 products) or computed counts (> 5,000 products)
 
@@ -181,6 +181,16 @@ def transform_run(run_dir, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS, pr
     output_dir = os.path.join(run_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
     truncation_log = []
+    metadata_path = os.path.join(run_dir, "extraction_metadata.json")
+    quality_path = os.path.join(run_dir, "data_quality.json")
+    metadata = {}
+    data_quality = []
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    if os.path.exists(quality_path):
+        with open(quality_path, "r", encoding="utf-8") as f:
+            data_quality = json.load(f)
 
     con = duckdb.connect()
 
@@ -413,10 +423,12 @@ def transform_run(run_dir, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS, pr
 
         f_json.write('\n  ],\n  "ProductRules": ' + json.dumps(nested_prs) + ",\n")
         f_json.write('  "PriceRules": ' + json.dumps(nested_prcs) + ",\n")
-        f_json.write('  "SummaryVariables": ' + json.dumps(summary_vars_raw) + "\n}\n")
+        f_json.write('  "SummaryVariables": ' + json.dumps(summary_vars_raw) + ",\n")
+        f_json.write('  "metadata": ' + json.dumps(metadata) + ",\n")
+        f_json.write('  "data_quality": ' + json.dumps(data_quality) + "\n}\n")
 
     # ---------------- Stream 21-Tab XLSX ----------------
-    step("Streaming 21-tab XLSX output...")
+    step("Streaming 23-tab XLSX output...")
     xlsx_path = os.path.join(output_dir, "cpq_extract.xlsx")
     wb = Workbook(write_only=True)
     child_sheets = {}
@@ -559,6 +571,31 @@ def transform_run(run_dir, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS, pr
     write_streaming_sheet(
         wb, "Summary Variables", summary_vars_raw, id_columns=[], truncation_log=truncation_log
     )
+    quality_rows = [
+        {
+            "Severity": finding.get("severity"),
+            "Entity": finding.get("entity"),
+            "Rule": finding.get("rule"),
+            "Product": finding.get("product"),
+            "Message": finding.get("message"),
+        }
+        for finding in data_quality
+    ]
+    write_streaming_sheet(
+        wb,
+        "Data Quality",
+        quality_rows or [{"Message": "No data-quality findings were recorded."}],
+        id_columns=[],
+        truncation_log=truncation_log,
+    )
+    metadata_rows = [
+        {"Field": key, "Value": value}
+        for key, value in metadata.items()
+    ] or [{"Field": "metadata", "Value": "Not available"}]
+    write_streaming_sheet(
+        wb, "Extraction Metadata", metadata_rows, id_columns=[],
+        truncation_log=truncation_log
+    )
 
     # Reorder sheets to put 4 main sheets first
     main_order = ["Products", "Product Rules", "Price Rules", "Summary Variables"]
@@ -580,4 +617,3 @@ def transform_run(run_dir, countif_max_products=DEFAULT_COUNTIF_MAX_PRODUCTS, pr
     }
 
     return counts, truncation_log
-
